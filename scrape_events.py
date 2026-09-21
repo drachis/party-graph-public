@@ -292,6 +292,7 @@ def main() -> None:
     ap.add_argument("--fresh", action="store_true", help="ignore saved files")
     ap.add_argument("--url", type=str, default=None, help="scrape a single URL (bypasses CSV)")
     ap.add_argument("--now", action="store_true", help="skip the evening window, run immediately")
+    ap.add_argument("--login", action="store_true", help="open browser for manual login, then wait for URL in stdin")
     args = ap.parse_args()
 
     df = None
@@ -380,7 +381,7 @@ def main() -> None:
         USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
         ctx = pw.chromium.launch_persistent_context(
             user_data_dir=str(USER_DATA_DIR),
-            headless=HEADLESS,
+            headless=False,
             user_agent=random.choice(UA_POOL),
             viewport={"width": random.randint(1300, 1520), "height": random.randint(850, 1000)},
             locale="en-US",
@@ -388,6 +389,71 @@ def main() -> None:
             args=["--disable-blink-features=AutomationControlled"],
         )
         ctx.add_init_script(INIT_SCRIPT)
+
+        # --- Login mode: open partiful.com, let user log in, then read URL from stdin ---
+        if args.login:
+            page = ctx.new_page()
+            page.goto("https://partiful.com", wait_until="domcontentloaded", timeout=60000)
+            print("\n=== LOGIN MODE ===")
+            print("Browser is open. Log in to Partiful if needed.")
+            print("Then paste an event URL and press Enter to scrape it:")
+            url = input("> ").strip()
+            if url:
+                m = TOKEN_RE.search(url)
+                if not m:
+                    log(f"could not extract token from: {url}")
+                    ctx.close()
+                    sys.exit(1)
+                tok = m.group(1)
+                log(f"scraping {tok}...")
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                except Exception:
+                    pass
+                human_dwell(page)
+                data = extract(page)
+                data["token"] = tok
+                data["url"] = url
+                data["scraped_at"] = datetime.now().isoformat()
+                (OUT_DIR / f"{tok}.json").write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+                log(f"saved -> {OUT_DIR / f'{tok}.json'}")
+                # Quick preview
+                f = data.get("fields", {})
+                if f:
+                    log("fields: " + ", ".join(f"{k}={v[:40]}" for k, v in f.items()))
+                else:
+                    log("WARNING: no fields extracted — page may still be loading or blocked")
+                print("\nBrowser stays open. Paste another URL or press Enter to close:")
+                while True:
+                    u = input("> ").strip()
+                    if not u:
+                        break
+                    m2 = TOKEN_RE.search(u)
+                    if not m2:
+                        log("no token found, try again")
+                        continue
+                    tok2 = m2.group(1)
+                    log(f"scraping {tok2}...")
+                    page.goto(u, wait_until="domcontentloaded", timeout=60000)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=15000)
+                    except Exception:
+                        pass
+                    human_dwell(page)
+                    data2 = extract(page)
+                    data2["token"] = tok2
+                    data2["url"] = u
+                    data2["scraped_at"] = datetime.now().isoformat()
+                    (OUT_DIR / f"{tok2}.json").write_text(json.dumps(data2, indent=2, ensure_ascii=False), encoding="utf-8")
+                    log(f"saved -> {OUT_DIR / f'{tok2}.json'}")
+                    f2 = data2.get("fields", {})
+                    if f2:
+                        log("fields: " + ", ".join(f"{k}={v[:40]}" for k, v in f2.items()))
+            page.close()
+            ctx.close()
+            log("login session saved. Re-run without --login to use the saved session.")
+            return
 
         used = int(state.get("used_today", 0))
         for i, (tok, url) in enumerate(todo, 1):
