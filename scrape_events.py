@@ -202,25 +202,35 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=None, help="cap today's visits (over budget)")
     ap.add_argument("--fresh", action="store_true", help="ignore saved files")
+    ap.add_argument("--url", type=str, default=None, help="scrape a single URL (bypasses CSV)")
     args = ap.parse_args()
 
-    if not CSV_IN.exists():
-        log(f"missing {CSV_IN}")
-        sys.exit(1)
+    df = None
+    if not args.url:
+        if not CSV_IN.exists():
+            log(f"missing {CSV_IN}")
+            sys.exit(1)
+        df = pd.read_csv(CSV_IN)
+        if "event_link" not in df.columns:
+            log(f"no 'event_link' column in {CSV_IN}; columns={list(df.columns)}")
+            sys.exit(1)
 
-    df = pd.read_csv(CSV_IN)
-    if "event_link" not in df.columns:
-        log(f"no 'event_link' column in {CSV_IN}; columns={list(df.columns)}")
-        sys.exit(1)
-
-    links = df["event_link"].dropna().astype(str).tolist()
-    seen, unique = set(), []
-    for u in links:
-        m = TOKEN_RE.search(u)
-        if m and m.group(1) not in seen:
-            seen.add(m.group(1))
-            unique.append((m.group(1), u))
-    log(f"unique tokens: {len(unique)}")
+    if args.url:
+        m = TOKEN_RE.search(args.url)
+        if not m:
+            log(f"could not extract token from: {args.url}")
+            sys.exit(1)
+        unique = [(m.group(1), args.url)]
+        log(f"single URL mode: token={unique[0][0]}")
+    else:
+        links = df["event_link"].dropna().astype(str).tolist()
+        seen, unique = set(), []
+        for u in links:
+            m = TOKEN_RE.search(u)
+            if m and m.group(1) not in seen:
+                seen.add(m.group(1))
+                unique.append((m.group(1), u))
+        log(f"unique tokens: {len(unique)}")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
