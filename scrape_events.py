@@ -56,6 +56,30 @@ TOKEN_RE = re.compile(r"partiful\.com/e/([A-Za-z0-9_-]+)")
 FIELD_LABELS = ["host", "hosts", "location", "venue", "address", "date", "time", "date_time", "description", "notes", "contact", "organizer", "price", "capacity"]
 
 
+
+# --- anti-detection init script ---
+INIT_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+const plugins = [
+  { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+  { name: 'Chrome PDF Plugin Stream', filename: 'internal-pdf-viewer', description: 'Portable Document Format (Stream)' },
+  { name: 'Chromium PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+  { name: 'Chromium PDF Plugin Stream', filename: 'internal-pdf-viewer', description: 'Portable Document Format (Stream)' },
+];
+Object.defineProperty(navigator, 'plugins', { get: () => plugins });
+
+const mimeTypes = [
+  { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format' },
+  { type: 'text/pdf', suffixes: 'pdf', description: 'Portable Document Format' },
+];
+Object.defineProperty(navigator, 'mimeTypes', { get: () => mimeTypes });
+
+if (!window.chrome) {
+  window.chrome = { runtime: {}, loadTimes: () => ({}) };
+}
+"""
+
 def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
@@ -258,7 +282,7 @@ def main() -> None:
             timezone_id="America/Los_Angeles",
             args=["--disable-blink-features=AutomationControlled"],
         )
-        ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+        ctx.add_init_script(INIT_SCRIPT)
 
         used = int(state.get("used_today", 0))
         for i, (tok, url) in enumerate(todo, 1):
