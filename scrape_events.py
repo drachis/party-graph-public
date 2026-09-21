@@ -203,6 +203,7 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=None, help="cap today's visits (over budget)")
     ap.add_argument("--fresh", action="store_true", help="ignore saved files")
     ap.add_argument("--url", type=str, default=None, help="scrape a single URL (bypasses CSV)")
+    ap.add_argument("--now", action="store_true", help="skip the evening window, run immediately")
     args = ap.parse_args()
 
     df = None
@@ -250,7 +251,10 @@ def main() -> None:
         log("nothing to do.")
         return
 
-    wait_for_window(parse_hhmm(WINDOW_START), parse_hhmm(WINDOW_END))
+    if not args.now:
+        wait_for_window(parse_hhmm(WINDOW_START), parse_hhmm(WINDOW_END))
+    else:
+        log("--now specified, skipping window wait")
 
     base_gap_lo = max((SPREAD_HOURS * 3600) / max(cap, 1) * 0.7, 4 * 60)
     base_gap_hi = max((SPREAD_HOURS * 3600) / max(cap, 1) * 1.3, 7 * 60)
