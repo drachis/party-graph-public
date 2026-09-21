@@ -324,7 +324,8 @@ def main() -> None:
                         log(f"  skipping {tok} for now (re-runnable)")
                     else:
                         time.sleep(random.uniform(3, 7) * attempt)
-            if used < cap:
+            # Only wait if there's another page queued up
+            if i < len(todo) and used < cap:
                 gap = random.uniform(base_gap_lo, base_gap_hi)
                 if random.random() < 0.10:
                     gap += random.uniform(20, 45)
