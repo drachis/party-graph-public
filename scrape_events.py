@@ -397,59 +397,113 @@ def main() -> None:
             print("\n=== LOGIN MODE ===")
             print("Browser is open. Log in to Partiful if needed.")
             print("Then paste an event URL and press Enter to scrape it:")
-            url = input("> ").strip()
-            if url:
-                m = TOKEN_RE.search(url)
-                if not m:
-                    log(f"could not extract token from: {url}")
-                    ctx.close()
-                    sys.exit(1)
-                tok = m.group(1)
-                log(f"scraping {tok}...")
+
+            def scrape_event(page, url, tok):
+                """Navigate, click guest tabs, collect all data."""
                 page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 try:
                     page.wait_for_load_state("networkidle", timeout=15000)
                 except Exception:
                     pass
                 human_dwell(page)
+
+                # --- Collect guest names by clicking each tab ---
+                guests = {"going": [], "maybe": [], "cant_go": [], "interested": []}
+                tab_labels = [
+                    ("Going", "going"),
+                    ("Maybe", "maybe"),
+                    ("Can't Go", "cant_go"),
+                    ("Interested", "interested"),
+                ]
+                for label, key in tab_labels:
+                    try:
+                        # Try to find and click the tab (multiple selector strategies)
+                        clicked = False
+                        for sel in [
+                            f"button:has-text('\"{label}\"')",
+                            f"[role=\"tab\"]:has-text('\"{label}\"')",
+                            f"a:has-text('\"{label}\"')",
+                            f"div[role=\"tablist\"] >> text=\"{label}\"",
+                        ]:
+                            try:
+                                el = page.locator(sel).first
+                                if el.is_visible(timeout=2000):
+                                    el.click(timeout=3000)
+                                    clicked = True
+                                    break
+                            except Exception:
+                                continue
+                        if not clicked:
+                            continue
+                        # Wait for guest list to populate
+                        page.wait_for_timeout(random.uniform(1500, 3000))
+                        # Extract names: look for list items / avatar links / name text
+                        names = page.evaluate("""
+                            () => {
+                                const items = [];
+                                // Strategy 1: list items in the guest section
+                                const lists = document.querySelectorAll('ul li, [class*="guest"] li, [class*="list"] li');
+                                lists.forEach(li => {
+                                    const txt = (li.innerText || '').trim();
+                                    if (txt && txt.length < 80 && !txt.includes('Going') && !txt.includes('Maybe') && !txt.includes('Interested') && !txt.includes('Can\'t')) {
+                                        items.push(txt);
+                                    }
+                                });
+                                // Strategy 2: links to /u/ profiles
+                                const links = document.querySelectorAll('a[href*="/u/"], a[href*="/user/"]');
+                                links.forEach(a => {
+                                    const txt = (a.innerText || '').trim();
+                                    if (txt && txt.length < 60 && !items.includes(txt)) {
+                                        items.push(txt);
+                                    }
+                                });
+                                // Strategy 3: any element with a name-like pattern
+                                const spans = document.querySelectorAll('[class*="name"], [class*="Name"], [data-testid*="name"]');
+                                spans.forEach(s => {
+                                    const txt = (s.innerText || '').trim();
+                                    if (txt && txt.length > 1 && txt.length < 60 && !items.includes(txt)) {
+                                        items.push(txt);
+                                    }
+                                });
+                                return items;
+                            }
+                        """)
+                        guests[key] = names
+                        log(f"  {label}: {len(names)} guests")
+                    except Exception as e:
+                        log(f"  {label}: failed ({e})")
+                        guests[key] = []
+
+                # Final extract
                 data = extract(page)
                 data["token"] = tok
                 data["url"] = url
                 data["scraped_at"] = datetime.now().isoformat()
+                data["guests"] = guests
+                return data
+
+            while True:
+                url = input("> ").strip()
+                if not url:
+                    break
+                m = TOKEN_RE.search(url)
+                if not m:
+                    log(f"could not extract token from: {url}")
+                    continue
+                tok = m.group(1)
+                log(f"scraping {tok}...")
+                data = scrape_event(page, url, tok)
                 (OUT_DIR / f"{tok}.json").write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
                 log(f"saved -> {OUT_DIR / f'{tok}.json'}")
-                # Quick preview
                 f = data.get("fields", {})
                 if f:
                     log("fields: " + ", ".join(f"{k}={v[:40]}" for k, v in f.items()))
+                g = data.get("guests", {})
+                total_guests = sum(len(v) for v in g.values())
+                if total_guests:
+                    log(f"guests: {total_guests} total " + " ".join(f"({k}:{len(v)})" for k, v in g.items() if v))
                 else:
-                    log("WARNING: no fields extracted — page may still be loading or blocked")
-                print("\nBrowser stays open. Paste another URL or press Enter to close:")
-                while True:
-                    u = input("> ").strip()
-                    if not u:
-                        break
-                    m2 = TOKEN_RE.search(u)
-                    if not m2:
-                        log("no token found, try again")
-                        continue
-                    tok2 = m2.group(1)
-                    log(f"scraping {tok2}...")
-                    page.goto(u, wait_until="domcontentloaded", timeout=60000)
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=15000)
-                    except Exception:
-                        pass
-                    human_dwell(page)
-                    data2 = extract(page)
-                    data2["token"] = tok2
-                    data2["url"] = u
-                    data2["scraped_at"] = datetime.now().isoformat()
-                    (OUT_DIR / f"{tok2}.json").write_text(json.dumps(data2, indent=2, ensure_ascii=False), encoding="utf-8")
-                    log(f"saved -> {OUT_DIR / f'{tok2}.json'}")
-                    f2 = data2.get("fields", {})
-                    if f2:
-                        log("fields: " + ", ".join(f"{k}={v[:40]}" for k, v in f2.items()))
+                    log("WARNING: no guests captured — may be restricted or selectors need updating")
             page.close()
             ctx.close()
             log("login session saved. Re-run without --login to use the saved session.")
