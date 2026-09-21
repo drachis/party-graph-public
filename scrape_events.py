@@ -31,10 +31,10 @@ from playwright.sync_api import sync_playwright
 
 # --- config ---
 CSV_IN = Path("data-request/rsvp_details.csv")
-OUT_DIR = Path("data-request/scraped")
-SUMMARY = Path("data-request/scraped_summary.csv")
-STATE = Path("data-request/scrape_state.json")
-USER_DATA_DIR = Path("data-request/.browser")
+OUT_DIR = Path("scraped_events")
+SUMMARY = Path("scraped_events/summary.csv")
+STATE = Path("scraped_events/scrape_state.json")
+USER_DATA_DIR = Path("scraped_events/.browser")
 
 MIN_DAILY = 8
 MAX_DAILY = 12

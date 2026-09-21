@@ -6,6 +6,10 @@ data-request/*
 !data-request/.gitkeep
 *.csv
 
+# Scraped output (private, regenerated)
+scraped_events/*
+!scraped_events/.gitkeep
+
 # Generated output
 event_calendar.html
 
