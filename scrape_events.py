@@ -53,7 +53,7 @@ BLOCK_SELECTORS = ["nav", "footer", "header", "[role='banner']", "[role='navigat
 FIELD_RE = re.compile(r"^\s*(Host|Hosts|Location|Venue|Address|Date|Time|Date & Time|Description|Notes|Contact|Organizer|Price|Capacity)\s*[:\-–—]\s*(.+?)\s*$", re.MULTILINE | re.IGNORECASE)
 TOKEN_RE = re.compile(r"partiful\.com/e/([A-Za-z0-9_-]+)")
 
-FIELD_LABELS = ["host", "hosts", "location", "venue", "address", "date", "time", "date_time", "description", "notes", "contact", "organizer", "price", "capacity"]
+
 
 
 
@@ -130,15 +130,103 @@ def extract(page) -> dict:
         "() => {"
         "  const root = document.body;"
         "  if (!root) return '';"
-        "  const block = document.querySelector('main') || root;"
-        "  return block.innerText || '';"
+        "  const block = document.querySelector(\"main\") || root;"
+        "  return block.innerText || \"\";"
         "}"
     )
+    # Strip Partiful page suffix from title
+    if title.endswith(" | Partiful"):
+        title = title[:-11].strip()
+
     fields: dict[str, str] = {}
-    for m in FIELD_RE.finditer(body):
-        key = m.group(1).lower().replace(" ", "_").replace("&", "_")
-        if key not in fields:
-            fields[key] = m.group(2)[:500]
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+
+    # --- RSVP stats (Going / Interested / Maybe) ---
+    stats_match = RSPV_STATS_RE.search(body)
+    if stats_match:
+        fields["rsvp_going"] = stats_match.group(1)
+        fields["rsvp_interested"] = stats_match.group(2)
+        fields["rsvp_maybe"] = stats_match.group(3)
+
+    # --- Positional parse: walk lines, track section context ---
+    in_host = False
+    in_venue = False
+    in_description = False
+    description_parts: list[str] = []
+
+    for i, line in enumerate(lines):
+        # Skip boilerplate
+        if line in ("Get the app", "Login", "Log in", "Remind me later",
+                    "Follow", "View all", "Learn More", "RSVP", "Interested",
+                    "Explore events", "Create a free event", "English",
+                    "Help", "Privacy Choices", "Blog", "Careers", "About",
+                    "Home", "Explore", "Create", "Send a card",
+                    "Restricted Access", "Trending This Week",
+                    "See all in 🗽️ Trending in NYC", "👍",
+                    "Already RSVP'd? Sign in", "+443"):
+            continue
+        if line.startswith("We use cookies"):
+            break
+
+        # Host section
+        if HOST_MARKER.match(line):
+            in_host = True
+            continue
+        if in_host:
+            # host name is next non-boilerplate line; "N upcoming events" follows
+            if "upcoming events" not in line and not line.isdigit():
+                fields.setdefault("host", line)
+                in_host = False
+                in_venue = True
+            continue
+        if in_venue:
+            # Skip "N upcoming events" / follower counts
+            if re.search(r"\d+\s+(upcoming events|followers|events)", line, re.IGNORECASE):
+                continue
+            # The next real line is the venue (or address)
+            if re.search(r"\b(St\.|Ave\.|Dr\.|Blvd\.|Rd\.|Ln\.|Way|Pl\.|Pkwy\.)\b", line) or re.search(r",\s*[A-Z]{2}\b", line):
+                fields.setdefault("address", line)
+            else:
+                fields.setdefault("venue", line)
+            in_venue = False
+            continue
+
+        # Guest list section ends the metadata zone
+        if GUEST_MARKER.match(line):
+            in_description = False
+            if description_parts:
+                fields.setdefault("description", " ".join(description_parts))
+            break
+
+        # Date line
+        if DATE_RE.match(line):
+            fields.setdefault("date", line)
+            continue
+
+        # Time line
+        if TIME_RE.match(line):
+            fields.setdefault("time", line)
+            continue
+
+        # Timezone hints (ET, PT, etc.) — skip
+        if re.match(r"^(ET|PT|CT|MT|PST|PDT|EST|EDT|CST|CDT|MST|MDT|GMT|UTC)$", line):
+            continue
+
+        # After date/time, before Guest List: could be venue, address, or description
+        # Heuristic: address has "St", "Ave", "Dr", "Blvd", "Rd", "Ln", "Way", "Pl", "NY", "CA", etc.
+        if re.search(r"\b(St\.|Ave\.|Dr\.|Blvd\.|Rd\.|Ln\.|Way|Pl\.|Pkwy\.|NY|CA|TX|FL|IL|WA|MA|PA|OH|GA|NC|MI|AZ|NV|OR|CO|VA|TN|IN|MO|MD|WI|MN|AL|SC|LA|KY|AR|MS|OK|IA|KS|NE|NV|UT|ID|NM|WV|HI|NH|ME|RI|DE|MD|VT|WY|MT|ND|SD|AK|DC|PR)\b", line):
+            fields.setdefault("address", line)
+            # Previous line (if not date/time/host) is likely the venue name
+            continue
+
+        # Generic: if we're past date/time and before guest list, accumulate as description
+        if "date" in fields or "time" in fields:
+            if line and not line.startswith("+") and len(line) > 2 and "upcoming events" not in line:
+                description_parts.append(line)
+
+    if description_parts:
+        fields.setdefault("description", " ".join(description_parts))
+
     return {"title": title, "body": body, "fields": fields}
 
 
@@ -275,13 +363,16 @@ def main() -> None:
         return {
             "token": d.get("token"),
             "event_link": d.get("url"),
-            "page_title": d.get("title"),
-            "host": pick("host", "hosts", "organizer"),
-            "location": pick("location", "venue", "address"),
+            "title": d.get("title"),
+            "host": pick("host"),
+            "venue": pick("venue"),
+            "address": pick("address"),
             "date": pick("date"),
-            "time": pick("time", "date_time"),
-            "description": pick("description", "notes"),
-            "status": d.get("status"),
+            "time": pick("time"),
+            "description": pick("description"),
+            "rsvp_going": pick("rsvp_going"),
+            "rsvp_interested": pick("rsvp_interested"),
+            "rsvp_maybe": pick("rsvp_maybe"),
             "scraped_at": d.get("scraped_at"),
         }
 
