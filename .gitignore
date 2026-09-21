@@ -1,0 +1,12 @@
+# Agent / harness config
+.continue/
+
+# Sensitive working data — do NOT commit (contains personal/PII)
+data-request/
+*.csv
+
+# Generated output
+event_calendar.html
+
+# Python
+
