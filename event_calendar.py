@@ -291,10 +291,14 @@ def build_month_card(year: int, month: int, day_events: dict[date, list[dict]],
             if d == today:
                 classes += " today"
             gmd = ""
+            est_mark = ""
             if n:
                 classes += " has-events"
                 if all(ev["estimated"] for ev in evs):
                     classes += " estimated"
+                    est_mark = '<span class="est-mark">≈</span>'
+                    attrs += (' title="Estimated: placed on the date you RSVP\'d, '
+                              'not the confirmed event date -- scrape this event for the real date."')
                 attrs += ' tabindex="0" role="button"'
                 totals = {b: sum(ev["counts"][b] for ev in evs) for b in DAY_BUCKETS}
                 gmd = '<div class="gmd">' + "".join(
@@ -302,7 +306,7 @@ def build_month_card(year: int, month: int, day_events: dict[date, list[dict]],
                 ) + '</div>'
             day_cells.append(
                 f'<div class="{classes}" {attrs}>'
-                f'<span class="daynum">{d.day}</span>{gmd}</div>'
+                f'<span class="daynum">{d.day}{est_mark}</span>{gmd}</div>'
             )
         week_rows.append(
             f'<div class="week-row" style="background:{heat}">'
@@ -327,8 +331,8 @@ def build_legend() -> str:
         '<div class="legend">'
         f'{swatches}'
         '<span class="legend-note">'
-        '<span class="dash-sample"></span> dashed border = estimated from '
-        'your RSVP date, not yet scraped</span>'
+        '<span class="dash-sample"></span> dashed + ≈ = your RSVP date, '
+        '<strong>not</strong> the confirmed event date (not yet scraped)</span>'
         '<span class="legend-note">'
         '<span class="heat-sample"></span> row shade = events that week '
         '(darker → busier)</span>'
@@ -399,6 +403,15 @@ def build_html(events: list[dict], skipped: int) -> str:
             f'<p class="warning">{skipped} file(s) had no parseable event date '
             "and were skipped.</p>"
         )
+    if n_estimated:
+        warning += (
+            f'<p class="warning">⚠ {n_estimated} of {len(events)} event(s) below '
+            "are placed on the date <em>you RSVP'd</em>, not the confirmed event "
+            "date -- the CSV export has no event-date column. Days marked "
+            "≈ / dashed are guesses; scrape that event "
+            "(<code>python scrape_events.py --url &lt;link&gt; --now</code>) to pin "
+            "down its real date.</p>"
+        )
 
     return f"""<!doctype html>
 <html lang="en">
@@ -427,7 +440,8 @@ def build_html(events: list[dict], skipped: int) -> str:
   }}
   .summary-bar strong {{ color: var(--ink); }}
   .warning {{ color: #8a5a00; background: #fff6e0; border: 1px solid #f0d78a;
-    border-radius: 8px; padding: 8px 12px; font-size: 0.85rem; }}
+    border-radius: 8px; padding: 8px 12px; font-size: 0.85rem; margin: 0 0 8px; }}
+  .warning code {{ background: rgba(0,0,0,0.06); border-radius: 4px; padding: 1px 5px; }}
   nav.month-nav {{
     position: sticky; top: 0; z-index: 5;
     display: flex; flex-wrap: wrap; gap: 6px;
@@ -491,6 +505,7 @@ def build_html(events: list[dict], skipped: int) -> str:
   }}
   .day.selected {{ box-shadow: 0 0 0 3px #1a1a1a; }}
   .daynum {{ position: absolute; top: 2px; left: 3px; color: var(--muted); }}
+  .est-mark {{ color: #8a5a00; font-weight: 700; margin-left: 1px; }}
   .gmd {{
     position: absolute; left: 2px; right: 2px; bottom: 2px;
     display: flex; gap: 1px;
@@ -540,7 +555,8 @@ def build_html(events: list[dict], skipped: int) -> str:
   <div class="summary-bar">
     <span><strong>{len(events)}</strong> event(s)</span>
     <span><strong>{n_confirmed}</strong> scraped in detail</span>
-    <span><strong>{n_estimated}</strong> estimated from RSVP history</span>
+    <span title="Placed on the date you RSVP'd -- not the confirmed event date">
+      <strong>{n_estimated}</strong> estimated from RSVP history</span>
     <span><strong>{total_going}</strong> total going</span>
     <span>Range: <strong>{date_range or "n/a"}</strong></span>
   </div>
