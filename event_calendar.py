@@ -1,11 +1,20 @@
 """
 Self-contained event calendar.
 
-Reads scraped_events/*.json (written by party_graph.pipeline) and renders a
-month-by-month heatmap calendar of event dates. Each day with an event is
-colored/sized by event count on a green (fewest) -> red (most) scale; clicking
-a highlighted day opens a detail panel with venue, host, RSVP counts, and
-guest names pulled straight from the scraped data.
+Populates the calendar in two layers, merged by Partiful event token:
+
+1. data-request/rsvp_details.csv -- every event you've ever RSVP'd to, gives
+   instant (if approximate) coverage. Its 'rsvp_date' is when *you* RSVP'd,
+   not the event date, so these entries are placed on that date and flagged
+   "estimated" until the real thing is scraped.
+2. scraped_events/*.json (written by party_graph.pipeline) -- once a token
+   is scraped, its entry is replaced wholesale with the confirmed date,
+   venue, host, and full per-status guest lists.
+
+Each day with an event is colored/sized by event count on a green (fewest)
+-> red (most) scale; clicking a highlighted day opens a detail panel with
+venue, host, RSVP counts, and guest names pulled straight from the scraped
+data (or your own RSVP status, for days not yet scraped).
 
 The page is pure HTML/CSS/JS with everything inlined -- no CDN, no plotly --
 so it renders identically online or off.
@@ -24,7 +33,9 @@ from calendar import Calendar
 from datetime import date, datetime
 from pathlib import Path
 
-from party_graph.config import OUT_DIR
+import pandas as pd
+
+from party_graph.config import CSV_IN, OUT_DIR, TOKEN_RE
 
 OUT = Path(__file__).parent / "event_calendar.html"
 
@@ -86,6 +97,79 @@ def parse_event_date(raw: str | None, scraped_at: str | None) -> date | None:
     return candidate
 
 
+def parse_rsvp_timestamp(raw: object) -> date | None:
+    """Parse the CSV's 'rsvp_date', e.g. 'Sep 08, 2023 03:51:32 PM UTC'."""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    if s.endswith(" UTC"):
+        s = s[: -len(" UTC")]
+    try:
+        return datetime.strptime(s, "%b %d, %Y %I:%M:%S %p").date()
+    except ValueError:
+        return None
+
+
+def load_csv_events(csv_path: Path) -> dict[str, dict]:
+    """Return {token: event} from rsvp_details.csv, keyed by Partiful token.
+
+    Placeholder entries only: date is your RSVP timestamp (not the event
+    date), so there's no venue/host/guest breakdown yet -- just your own
+    status and plus-one count. Marked estimated=True; merge_events()
+    replaces any token also present in scraped_events/ with the real thing.
+    """
+    if not csv_path.exists():
+        return {}
+    df = pd.read_csv(csv_path)
+    required = {"title", "event_link", "status", "rsvp_date", "plus_one_count"}
+    if not required.issubset(df.columns):
+        return {}
+
+    out: dict[str, dict] = {}
+    for _, row in df.iterrows():
+        url = str(row.get("event_link", ""))
+        m = TOKEN_RE.search(url)
+        if not m:
+            continue
+        ev_date = parse_rsvp_timestamp(row.get("rsvp_date"))
+        if ev_date is None:
+            continue
+        token = m.group(1)
+        out[token] = {
+            "token": token,
+            "title": str(row.get("title") or token),
+            "url": url,
+            "date": ev_date,
+            "time": "",
+            "host": "",
+            "venue": "",
+            "address": "",
+            "counts": {s: 0 for s in GUEST_STATUSES},
+            "guests": {s: [] for s in GUEST_STATUSES},
+            "estimated": True,
+            "your_status": str(row.get("status") or ""),
+            "plus_one_count": int(row.get("plus_one_count") or 0),
+        }
+    return out
+
+
+def merge_events(csv_events: dict[str, dict], scraped_events: list[dict]) -> list[dict]:
+    """CSV rows populate the calendar first; a scraped entry for the same
+    token replaces it wholesale (confirmed date/venue/guests), carrying
+    forward the CSV's own RSVP status/plus-one if the scrape doesn't have it
+    (the scraped guest list is other guests, not your own RSVP)."""
+    merged = dict(csv_events)
+    for ev in scraped_events:
+        prior = merged.get(ev["token"], {})
+        ev = dict(ev)
+        ev["your_status"] = ev.get("your_status") or prior.get("your_status", "")
+        ev["plus_one_count"] = ev.get("plus_one_count") or prior.get("plus_one_count", 0)
+        merged[ev["token"]] = ev
+    return list(merged.values())
+
+
 def load_events(out_dir: Path) -> tuple[list[dict], int]:
     """Return (events, skipped_count) from every scraped_events/*.json."""
     events: list[dict] = []
@@ -125,6 +209,9 @@ def load_events(out_dir: Path) -> tuple[list[dict], int]:
                 s: [g.get("name", "") for g in (guests.get(s, []) or [])]
                 for s in GUEST_STATUSES
             },
+            "estimated": False,
+            "your_status": "",
+            "plus_one_count": 0,
         })
     return events, skipped
 
@@ -180,10 +267,13 @@ def build_month_card(year: int, month: int, day_events: dict[date, list[dict]],
                 classes += " today"
             if n:
                 classes += " has-events"
+                if all(ev["estimated"] for ev in evs):
+                    classes += " estimated"
                 bg = color_for(n, max_count)
                 style = f' style="background:{bg}"'
                 attrs += ' tabindex="0" role="button"'
-            badge = f'<span class="badge">{n}</span>' if n else ""
+            badge_text = f"~{n}" if n and all(ev["estimated"] for ev in evs) else str(n)
+            badge = f'<span class="badge">{badge_text}</span>' if n else ""
             day_cells.append(
                 f'<div class="{classes}"{style} {attrs}>'
                 f'<span class="daynum">{d.day}</span>{badge}</div>'
@@ -213,6 +303,9 @@ def build_legend(max_count: int) -> str:
         '<span class="legend-label">Fewer events</span>'
         f'{"".join(swatches)}'
         '<span class="legend-label">More events</span>'
+        '<span class="legend-note">'
+        '<span class="dash-sample"></span> dashed + ~N = estimated from your '
+        'RSVP date, not yet scraped</span>'
         '</div>'
     )
 
@@ -227,6 +320,8 @@ def build_html(events: list[dict], skipped: int) -> str:
     months = sorted({(d.year, d.month) for d in day_events})
 
     total_going = sum(ev["counts"]["going"] for ev in events)
+    n_estimated = sum(1 for ev in events if ev["estimated"])
+    n_confirmed = len(events) - n_estimated
     date_range = ""
     if events:
         lo, hi = min(day_events), max(day_events)
@@ -258,6 +353,9 @@ def build_html(events: list[dict], skipped: int) -> str:
                 "address": ev["address"],
                 "counts": ev["counts"],
                 "guests": ev["guests"],
+                "estimated": ev["estimated"],
+                "your_status": ev["your_status"],
+                "plus_one_count": ev["plus_one_count"],
             }
             for ev in evs
         ]
@@ -311,8 +409,13 @@ def build_html(events: list[dict], skipped: int) -> str:
     color: var(--accent); text-decoration: none;
   }}
   nav.month-nav a:hover {{ border-color: var(--accent); }}
-  .legend {{ display: flex; align-items: center; gap: 6px; margin: 4px 0 18px; }}
+  .legend {{ display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 4px 0 18px; }}
   .legend-label {{ font-size: 0.78rem; color: var(--muted); }}
+  .legend-note {{ font-size: 0.75rem; color: var(--muted); margin-left: 10px; }}
+  .dash-sample {{
+    display: inline-block; width: 16px; height: 12px; border-radius: 3px;
+    border: 1.5px dashed #9aa1ab; vertical-align: middle;
+  }}
   .swatch {{
     width: 30px; height: 20px; border-radius: 4px; border: 1px solid rgba(0,0,0,0.08);
     display: flex; align-items: center; justify-content: center;
@@ -341,6 +444,7 @@ def build_html(events: list[dict], skipped: int) -> str:
   .day.empty {{ background: transparent; border-color: transparent; }}
   .day.today {{ box-shadow: inset 0 0 0 2px var(--accent); }}
   .day.has-events {{ cursor: pointer; color: #1a1a1a; font-weight: 600; }}
+  .day.estimated {{ border-style: dashed; border-color: #9aa1ab; }}
   .day.has-events:hover, .day.has-events:focus {{
     outline: none; box-shadow: 0 0 0 2px var(--accent);
   }}
@@ -366,6 +470,10 @@ def build_html(events: list[dict], skipped: int) -> str:
   #detail-panel .event-block:last-child {{ border-bottom: none; }}
   #detail-panel .meta {{ color: var(--muted); font-size: 0.82rem; margin: 2px 0; }}
   #detail-panel a {{ color: var(--accent); }}
+  #detail-panel .estimated-note {{
+    color: #8a5a00; background: #fff6e0; border: 1px solid #f0d78a;
+    border-radius: 6px; padding: 4px 8px; font-size: 0.78rem; margin: 4px 0;
+  }}
   .rsvp-counts {{ display: flex; gap: 12px; margin: 6px 0; font-size: 0.8rem; }}
   .rsvp-counts span {{ background: #f0f1f3; border-radius: 6px; padding: 2px 8px; }}
   details.guest-list {{ margin-top: 4px; font-size: 0.82rem; }}
@@ -379,11 +487,12 @@ def build_html(events: list[dict], skipped: int) -> str:
 </head>
 <body>
   <h1>Event Calendar</h1>
-  <p class="subtitle">Generated from scraped_events/*.json</p>
+  <p class="subtitle">Generated from rsvp_details.csv, enriched by scraped_events/*.json</p>
 
   <div class="summary-bar">
     <span><strong>{len(events)}</strong> event(s)</span>
-    <span><strong>{len(day_events)}</strong> day(s) with events</span>
+    <span><strong>{n_confirmed}</strong> scraped in detail</span>
+    <span><strong>{n_estimated}</strong> estimated from RSVP history</span>
     <span><strong>{total_going}</strong> total going</span>
     <span>Range: <strong>{date_range or "n/a"}</strong></span>
   </div>
@@ -448,13 +557,26 @@ def build_html(events: list[dict], skipped: int) -> str:
         block.appendChild(el('div', {{ cls: 'meta', text: metaParts.join(' \\u00b7 ') }}));
       }}
 
-      const rsvp = el('div', {{ cls: 'rsvp-counts' }});
-      [['going', 'Going'], ['maybe', 'Maybe'], ['interested', 'Interested'], ['cant_go', "Can't Go"]]
-        .forEach(function (pair) {{
-          const n = (ev.counts || {{}})[pair[0]] || 0;
-          rsvp.appendChild(el('span', {{ text: pair[1] + ': ' + n }}));
-        }});
-      block.appendChild(rsvp);
+      if (ev.estimated) {{
+        block.appendChild(el('div', {{
+          cls: 'estimated-note',
+          text: 'Date estimated from your RSVP timestamp \\u2014 run the scraper for the confirmed date/venue/guests.',
+        }}));
+      }}
+      if (ev.your_status) {{
+        const plusOne = ev.plus_one_count ? ' (+' + ev.plus_one_count + ')' : '';
+        block.appendChild(el('div', {{ cls: 'meta', text: 'Your RSVP: ' + ev.your_status + plusOne }}));
+      }}
+
+      if (!ev.estimated) {{
+        const rsvp = el('div', {{ cls: 'rsvp-counts' }});
+        [['going', 'Going'], ['maybe', 'Maybe'], ['interested', 'Interested'], ['cant_go', "Can't Go"]]
+          .forEach(function (pair) {{
+            const n = (ev.counts || {{}})[pair[0]] || 0;
+            rsvp.appendChild(el('span', {{ text: pair[1] + ': ' + n }}));
+          }});
+        block.appendChild(rsvp);
+      }}
 
       ['going', 'maybe', 'interested', 'cant_go'].forEach(function (key) {{
         const names = (ev.guests || {{}})[key] || [];
@@ -521,24 +643,28 @@ def build_html(events: list[dict], skipped: int) -> str:
 
 
 def main() -> None:
-    if not OUT_DIR.exists():
-        sys.exit(f"No {OUT_DIR}/ directory found -- run the scraper first.")
+    if not CSV_IN.exists() and not OUT_DIR.exists():
+        sys.exit(f"Neither {CSV_IN} nor {OUT_DIR}/ was found -- nothing to build a calendar from.")
 
-    events, skipped = load_events(OUT_DIR)
+    csv_events = load_csv_events(CSV_IN)
+    scraped_events, skipped = load_events(OUT_DIR) if OUT_DIR.exists() else ([], 0)
+    events = merge_events(csv_events, scraped_events)
+
     if not events:
-        print(f"No events with a parseable date found in {OUT_DIR}/.")
+        print("No events with a parseable date found.")
         if skipped:
-            print(f"({skipped} file(s) skipped: unparseable or missing date.)")
+            print(f"({skipped} file(s) in {OUT_DIR}/ skipped: unparseable or missing date.)")
 
     html_doc = build_html(events, skipped)
     OUT.write_text(html_doc, encoding="utf-8")
     webbrowser.open(OUT.resolve().as_uri())
 
+    n_estimated = sum(1 for ev in events if ev["estimated"])
     print(f"Wrote {OUT} and opened in browser.")
-    print(f"{len(events)} event(s) across "
-          f"{len({e['date'] for e in events})} day(s).")
+    print(f"{len(events)} event(s) across {len({e['date'] for e in events})} day(s) "
+          f"({len(events) - n_estimated} scraped in detail, {n_estimated} estimated from RSVP history).")
     if skipped:
-        print(f"WARNING: {skipped} file(s) had no parseable event date and were skipped.")
+        print(f"WARNING: {skipped} file(s) in {OUT_DIR}/ had no parseable event date and were skipped.")
 
 
 if __name__ == "__main__":
