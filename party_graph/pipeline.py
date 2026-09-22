@@ -35,7 +35,7 @@ from party_graph.output import (
 )
 from party_graph.scraper import BotDetected, gather_date_once, scrape_login_mode, scrape_once
 from party_graph.state import draw_budget, load_state, robots_allow, save_state, wait_for_window
-from party_graph.utils import log, parse_hhmm, parse_rsvp_timestamp
+from party_graph.utils import log, looks_like_closed_browser, parse_hhmm, parse_rsvp_timestamp
 
 
 def load_tokens(fresh: bool = False) -> list[tuple[str, str]]:
@@ -137,6 +137,7 @@ def run(args: argparse.Namespace) -> None:
 
             log(f"({i}/{len(todo)}) {tok}  [used {used}/{cap}]")
 
+            browser_died = False
             for attempt in range(1, 4):
                 try:
                     d = scrape_once(url, ctx)
@@ -148,11 +149,18 @@ def run(args: argparse.Namespace) -> None:
                     save_state(state)
                     break
                 except Exception as e:
+                    if looks_like_closed_browser(e):
+                        log(f"  !! browser/context closed unexpectedly ({e.__class__.__name__}) "
+                            "-- stopping now rather than retrying/continuing through every remaining item.")
+                        browser_died = True
+                        break
                     log(f"  attempt {attempt}/3 failed: {e.__class__.__name__}: {e}")
                     if attempt == 3:
                         log(f"  skipping {tok} for now (re-runnable)")
                     else:
                         time.sleep(random.uniform(3, 7) * attempt)
+            if browser_died:
+                break
 
             # Inter-visit gap (skip after last item)
             if i < len(todo) and used < cap:
@@ -162,7 +170,10 @@ def run(args: argparse.Namespace) -> None:
                 log(f"  waiting {gap:.0f}s before next")
                 time.sleep(gap)
 
-        ctx.close()
+        try:
+            ctx.close()
+        except Exception:
+            pass
 
     log("done for this run.")
 
@@ -238,6 +249,10 @@ def run_gather_dates(args: argparse.Namespace) -> None:
                     "-- stopping the run now, not pushing further.")
                 break
             except Exception as e:
+                if looks_like_closed_browser(e):
+                    log(f"  !! browser/context closed unexpectedly ({e.__class__.__name__}) "
+                        "-- stopping now rather than failing through every remaining item.")
+                    break
                 log(f"  failed: {e.__class__.__name__}: {e}")
                 continue
 
@@ -264,6 +279,9 @@ def run_gather_dates(args: argparse.Namespace) -> None:
                 log(f"  waiting {gap:.0f}s before next")
                 time.sleep(gap)
 
-        ctx.close()
+        try:
+            ctx.close()
+        except Exception:
+            pass
 
     log("gather-dates pass complete.")
