@@ -11,6 +11,15 @@ OUT_DIR = Path("scraped_events")
 SUMMARY = Path("scraped_events/summary.csv")
 STATE = Path("scraped_events/scrape_state.json")
 USER_DATA_DIR = Path("scraped_events/.browser")
+# Lightweight date-only cache written by --gather-dates: {token: {...}}.
+# Separate from OUT_DIR's per-event JSON, which carries the full guest list.
+EVENT_DATES = Path("scraped_events/event_dates.json")
+
+# --- Gather-dates pacing (date-only pass; no guest-list interaction) ---
+GATHER_DWELL_MIN = 20.0
+GATHER_DWELL_MAX = 30.0
+GATHER_GAP_MIN = 4.0
+GATHER_GAP_MAX = 9.0
 
 # --- Pacing ---
 MIN_DAILY = 8

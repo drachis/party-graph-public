@@ -41,3 +41,19 @@ def human_dwell(page) -> None:
     if random.random() < 0.4:
         page.evaluate("window.scrollTo(0,0)")
         time.sleep(random.uniform(0.4, 1.0))
+
+
+def long_dwell(page, lo: float, hi: float) -> None:
+    """Linger on a page for lo-hi seconds total with light scrolling.
+
+    Used by --gather-dates, which only reads the page's date text and
+    otherwise never touches it -- no guest-list tabs, no clicks -- so this
+    is the only thing standing in for "a person reading the page".
+    """
+    target = random.uniform(lo, hi)
+    elapsed = 0.0
+    while elapsed < target:
+        page.mouse.wheel(0, random.randint(200, 800))
+        pause = min(random.uniform(1.5, 3.5), target - elapsed)
+        time.sleep(max(pause, 0.0))
+        elapsed += pause

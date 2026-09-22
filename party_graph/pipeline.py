@@ -5,23 +5,33 @@ import argparse
 import random
 import sys
 import time
+from datetime import datetime
 
 import pandas as pd
 from playwright.sync_api import sync_playwright
 
-from party_graph.browser import launch_context, scrape_login_mode
+from party_graph.browser import launch_context
 from party_graph.config import (
     CSV_IN,
+    GATHER_GAP_MAX,
+    GATHER_GAP_MIN,
     OUT_DIR,
     SPREAD_HOURS,
     TOKEN_RE,
     WINDOW_END,
     WINDOW_START,
 )
-from party_graph.output import append_summary, event_path, save_event, summary_row
-from party_graph.scraper import scrape_once
+from party_graph.output import (
+    append_summary,
+    event_path,
+    load_event_dates,
+    save_event,
+    save_event_dates,
+    summary_row,
+)
+from party_graph.scraper import gather_date_once, scrape_login_mode, scrape_once
 from party_graph.state import draw_budget, load_state, robots_allow, save_state, wait_for_window
-from party_graph.utils import log, parse_hhmm
+from party_graph.utils import log, parse_hhmm, parse_rsvp_timestamp
 
 
 def load_tokens(fresh: bool = False) -> list[tuple[str, str]]:
@@ -151,3 +161,90 @@ def run(args: argparse.Namespace) -> None:
         ctx.close()
 
     log("done for this run.")
+
+
+def load_csv_by_rsvp_recency() -> list[tuple[str, str]]:
+    """[(token, url)] from the CSV, newest RSVP first (reverse chronological).
+
+    Rows with no parseable rsvp_date sort last (oldest), since we have no
+    better ordering for them.
+    """
+    if not CSV_IN.exists():
+        log(f"missing {CSV_IN}")
+        sys.exit(1)
+    df = pd.read_csv(CSV_IN)
+    if not {"event_link", "rsvp_date"}.issubset(df.columns):
+        log(f"CSV missing event_link/rsvp_date; columns={list(df.columns)}")
+        sys.exit(1)
+
+    rows: list[tuple[str, str, object]] = []
+    seen: set[str] = set()
+    for _, row in df.iterrows():
+        url = str(row.get("event_link", ""))
+        m = TOKEN_RE.search(url)
+        if not m or m.group(1) in seen:
+            continue
+        seen.add(m.group(1))
+        ts = parse_rsvp_timestamp(row.get("rsvp_date"))
+        rows.append((m.group(1), url, ts))
+
+    rows.sort(key=lambda r: r[2] or datetime.min, reverse=True)
+    return [(tok, url) for tok, url, _ in rows]
+
+
+def run_gather_dates(args: argparse.Namespace) -> None:
+    """Light-touch pass: visit each CSV event just long enough to read its
+    real date, skip everything guest-list related, and cache the result in
+    scraped_events/event_dates.json (separate from the full per-event JSON
+    that a normal scrape writes). Walks the CSV reverse-chronologically
+    (newest RSVP first) so recent/likely-upcoming events get dated first.
+
+    Does not touch the daily budget or evening window -- this is meant to
+    be a much cheaper, standalone pass than the full guest-list scrape.
+    """
+    all_tokens = load_csv_by_rsvp_recency()
+    log(f"gather-dates: {len(all_tokens)} unique CSV event(s)")
+
+    known = load_event_dates()
+    todo = [
+        (tok, url) for tok, url in all_tokens
+        if tok not in known and not event_path(tok).exists()
+    ]
+    if args.limit:
+        todo = todo[: args.limit]
+    log(f"gather-dates: {len(todo)} event(s) to visit "
+        f"(skipping already-dated or fully-scraped)")
+    if not todo:
+        log("nothing to do.")
+        return
+
+    _ok, min_gap = robots_allow(todo[0][1])
+    gap_lo = max(GATHER_GAP_MIN, min_gap or 0)
+    gap_hi = max(GATHER_GAP_MAX, gap_lo)
+
+    with sync_playwright() as pw:
+        ctx = launch_context(pw)
+        for i, (tok, url) in enumerate(todo, 1):
+            log(f"({i}/{len(todo)}) {tok}")
+            try:
+                d = gather_date_once(url, ctx)
+            except Exception as e:
+                log(f"  failed: {e.__class__.__name__}: {e}")
+                continue
+
+            d["token"] = tok
+            known[tok] = d
+            save_event_dates(known)
+            if d.get("raw_date"):
+                log(f"  -> {d['raw_date']!r}")
+            else:
+                log("  -> no date text found (page may be restricted/changed)")
+
+            if i < len(todo):
+                gap = random.uniform(gap_lo, gap_hi)
+                log(f"  waiting {gap:.0f}s before next")
+                time.sleep(gap)
+
+        ctx.close()
+
+    log("gather-dates pass complete.")

@@ -3,9 +3,46 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from party_graph.browser import human_dwell
-from party_graph.extract import extract
+from party_graph.browser import human_dwell, long_dwell
+from party_graph.config import GATHER_DWELL_MAX, GATHER_DWELL_MIN
+from party_graph.extract import extract, extract_fields
 from party_graph.utils import log
+
+
+def gather_date_once(url: str, ctx) -> dict:
+    """Visit a page just long enough to read its date -- no guest-list
+    interaction at all, not even the text-based guest parsing extract()
+    does. Returns {title, url, raw_date, raw_time, scraped_at}; the caller
+    adds 'token' and merges it into the event_dates.json cache.
+    """
+    page = ctx.new_page()
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+        long_dwell(page, GATHER_DWELL_MIN, GATHER_DWELL_MAX)
+
+        title = page.title()
+        if title.endswith(" | Partiful"):
+            title = title[: -len(" | Partiful")].strip()
+        body = page.evaluate(
+            "() => {"
+            "  const block = document.querySelector('main') || document.body;"
+            "  return block ? block.innerText : '';"
+            "}"
+        )
+        fields = extract_fields(body)
+        return {
+            "title": title,
+            "url": url,
+            "raw_date": fields.get("date", ""),
+            "raw_time": fields.get("time", ""),
+            "scraped_at": datetime.now().isoformat(),
+        }
+    finally:
+        page.close()
 
 
 def scrape_once(url: str, ctx) -> dict:

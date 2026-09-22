@@ -5,11 +5,27 @@ import csv
 import json
 from pathlib import Path
 
-from party_graph.config import OUT_DIR, SUMMARY
+from party_graph.config import EVENT_DATES, OUT_DIR, SUMMARY
 
 
 def event_path(token: str) -> Path:
     return OUT_DIR / f"{token}.json"
+
+
+def load_event_dates() -> dict:
+    """Read the gather-dates cache: {token: {title, url, raw_date, raw_time,
+    scraped_at}}. Missing/corrupt file just means nothing gathered yet."""
+    if EVENT_DATES.exists():
+        try:
+            return json.loads(EVENT_DATES.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_event_dates(data: dict) -> None:
+    EVENT_DATES.parent.mkdir(parents=True, exist_ok=True)
+    EVENT_DATES.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def save_event(data: dict) -> Path:
