@@ -13,8 +13,12 @@ from playwright.sync_api import sync_playwright
 from party_graph.browser import launch_context
 from party_graph.config import (
     CSV_IN,
+    GATHER_EMPTY_STREAK_LIMIT,
     GATHER_GAP_MAX,
     GATHER_GAP_MIN,
+    GATHER_LONG_PAUSE_CHANCE,
+    GATHER_LONG_PAUSE_MAX,
+    GATHER_LONG_PAUSE_MIN,
     OUT_DIR,
     SPREAD_HOURS,
     TOKEN_RE,
@@ -29,7 +33,7 @@ from party_graph.output import (
     save_event_dates,
     summary_row,
 )
-from party_graph.scraper import gather_date_once, scrape_login_mode, scrape_once
+from party_graph.scraper import BotDetected, gather_date_once, scrape_login_mode, scrape_once
 from party_graph.state import draw_budget, load_state, robots_allow, save_state, wait_for_window
 from party_graph.utils import log, parse_hhmm, parse_rsvp_timestamp
 
@@ -222,12 +226,17 @@ def run_gather_dates(args: argparse.Namespace) -> None:
     gap_lo = max(GATHER_GAP_MIN, min_gap or 0)
     gap_hi = max(GATHER_GAP_MAX, gap_lo)
 
+    consecutive_empty = 0
     with sync_playwright() as pw:
         ctx = launch_context(pw)
         for i, (tok, url) in enumerate(todo, 1):
             log(f"({i}/{len(todo)}) {tok}")
             try:
                 d = gather_date_once(url, ctx)
+            except BotDetected as e:
+                log(f"  !! looks like Partiful is flagging this as bot activity ({e}) "
+                    "-- stopping the run now, not pushing further.")
+                break
             except Exception as e:
                 log(f"  failed: {e.__class__.__name__}: {e}")
                 continue
@@ -236,12 +245,22 @@ def run_gather_dates(args: argparse.Namespace) -> None:
             known[tok] = d
             save_event_dates(known)
             if d.get("raw_date"):
+                consecutive_empty = 0
                 log(f"  -> {d['raw_date']!r}")
             else:
+                consecutive_empty += 1
                 log("  -> no date text found (page may be restricted/changed)")
+                if consecutive_empty >= GATHER_EMPTY_STREAK_LIMIT:
+                    log(f"  !! {consecutive_empty} dateless pages in a row -- more likely a "
+                        "soft block than that many individually-restricted events. "
+                        "Stopping out of caution.")
+                    break
 
             if i < len(todo):
                 gap = random.uniform(gap_lo, gap_hi)
+                if random.random() < GATHER_LONG_PAUSE_CHANCE:
+                    gap += random.uniform(GATHER_LONG_PAUSE_MIN, GATHER_LONG_PAUSE_MAX)
+                    log("  (taking a longer break, like someone got distracted)")
                 log(f"  waiting {gap:.0f}s before next")
                 time.sleep(gap)
 

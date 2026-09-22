@@ -16,10 +16,17 @@ USER_DATA_DIR = Path("scraped_events/.browser")
 EVENT_DATES = Path("scraped_events/event_dates.json")
 
 # --- Gather-dates pacing (date-only pass; no guest-list interaction) ---
+# Deliberately slow -- reads like someone actually browsing, not a script.
 GATHER_DWELL_MIN = 20.0
 GATHER_DWELL_MAX = 30.0
-GATHER_GAP_MIN = 4.0
-GATHER_GAP_MAX = 9.0
+GATHER_GAP_MIN = 12.0
+GATHER_GAP_MAX = 28.0
+GATHER_LONG_PAUSE_CHANCE = 0.15  # occasional longer break, like a distracted human
+GATHER_LONG_PAUSE_MIN = 40.0
+GATHER_LONG_PAUSE_MAX = 100.0
+# Stop the run if this many pages in a row come back dateless -- more
+# likely a soft block than that many individually-restricted events.
+GATHER_EMPTY_STREAK_LIMIT = 3
 
 # --- Pacing ---
 MIN_DAILY = 8

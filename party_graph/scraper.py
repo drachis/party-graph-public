@@ -8,21 +8,71 @@ from party_graph.config import GATHER_DWELL_MAX, GATHER_DWELL_MIN
 from party_graph.extract import extract, extract_fields
 from party_graph.utils import log
 
+# Phrases that mean "this is a challenge/block page", not a real Partiful
+# event -- checked on both HTTP status and page text so gather-dates can
+# ditch out the moment it looks like the site is flagging us as a bot.
+_BLOCK_SIGNS = (
+    "captcha", "are you a robot", "unusual traffic", "access denied",
+    "just a moment", "attention required", "too many requests",
+    "rate limit", "verify you are human", "automated queries",
+    "checking your browser", "cloudflare",
+)
+
+
+class BotDetected(Exception):
+    """Raised when a page looks like an anti-bot challenge/block rather
+    than a real event page. The caller should stop the whole run, not
+    just skip this one item and move on."""
+
+
+def _looks_blocked(page, response) -> str | None:
+    """Return a short reason if this looks like a block/challenge page."""
+    if response is not None and response.status in (403, 429, 503):
+        return f"HTTP {response.status}"
+    try:
+        title = (page.title() or "").lower()
+    except Exception:
+        title = ""
+    if any(sign in title for sign in _BLOCK_SIGNS):
+        return f"page title looks like a block page: {title!r}"
+    try:
+        snippet = page.evaluate(
+            "() => document.body ? document.body.innerText.slice(0, 500) : ''"
+        ).lower()
+    except Exception:
+        snippet = ""
+    if any(sign in snippet for sign in _BLOCK_SIGNS):
+        return "page body looks like a block/challenge page"
+    return None
+
 
 def gather_date_once(url: str, ctx) -> dict:
     """Visit a page just long enough to read its date -- no guest-list
     interaction at all, not even the text-based guest parsing extract()
     does. Returns {title, url, raw_date, raw_time, scraped_at}; the caller
     adds 'token' and merges it into the event_dates.json cache.
+
+    Raises BotDetected if the page looks like a challenge/block rather than
+    a real event -- checked before AND after the dwell, so a run never
+    lingers on (or keeps going past) a page that flags us as a bot.
     """
     page = ctx.new_page()
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
         try:
             page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
             pass
+
+        reason = _looks_blocked(page, response)
+        if reason:
+            raise BotDetected(reason)
+
         long_dwell(page, GATHER_DWELL_MIN, GATHER_DWELL_MAX)
+
+        reason = _looks_blocked(page, None)
+        if reason:
+            raise BotDetected(reason)
 
         title = page.title()
         if title.endswith(" | Partiful"):
