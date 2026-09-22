@@ -1,6 +1,7 @@
 """Pipeline: load CSV, enforce budget, pace visits, retry, save results."""
 from __future__ import annotations
 
+import argparse
 import random
 import sys
 import time
@@ -70,8 +71,6 @@ def compute_gaps(cap: int, min_gap: float | None) -> tuple[float, float]:
 
 def run(args: argparse.Namespace) -> None:
     """Main pipeline entry point."""
-    import argparse  # noqa: F401  (type hint above)
-
     # --- Load targets ---
     if args.url:
         unique = load_single_url(args.url)
