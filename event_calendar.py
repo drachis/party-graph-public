@@ -244,17 +244,42 @@ def month_weeks(year: int, month: int) -> list[list[date | None]]:
     ]
 
 
+def week_heat_color(value: int, max_value: int) -> str:
+    """Pastel green(0) -> yellow -> red(max) wash for a week row's background.
+
+    Uses the same three hues as the per-day Going/Maybe/Can't Go chips, just
+    lighter, so a busy week reads as a soft red band and a quiet one as soft
+    green, without drowning out the day numbers/chips drawn on top.
+    """
+    if max_value <= 0 or value <= 0:
+        return "transparent"
+    t = max(0.0, min(1.0, value / max_value))
+    stops = [(0.0, (217, 242, 217)), (0.5, (253, 240, 189)), (1.0, (249, 199, 199))]
+    for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
+        if t <= t1:
+            k = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+            r = round(c0[0] + k * (c1[0] - c0[0]))
+            g = round(c0[1] + k * (c1[1] - c0[1]))
+            b = round(c0[2] + k * (c1[2] - c0[2]))
+            return f"rgb({r},{g},{b})"
+    return "transparent"
+
+
 def build_month_card(year: int, month: int, day_events: dict[date, list[dict]],
-                      today: date) -> str:
+                      today: date, max_week_count: int) -> str:
     label = f"{_MONTH_NAMES[month - 1]} {year}"
-    count = sum(len(day_events.get(d, [])) for week in month_weeks(year, month)
-                for d in week if d)
+    weeks = month_weeks(year, month)
+    count = sum(len(day_events.get(d, [])) for week in weeks for d in week if d)
     anchor = f"m-{year}-{month:02d}"
 
     header_cells = "".join(f'<div class="wd">{h}</div>' for h in _WEEKDAY_HEADERS)
 
-    day_cells = []
-    for week in month_weeks(year, month):
+    week_rows = []
+    for week in weeks:
+        week_total = sum(len(day_events.get(d, [])) for d in week if d)
+        heat = week_heat_color(week_total, max_week_count)
+
+        day_cells = []
         for d in week:
             if d is None:
                 day_cells.append('<div class="day empty"></div>')
@@ -279,13 +304,17 @@ def build_month_card(year: int, month: int, day_events: dict[date, list[dict]],
                 f'<div class="{classes}" {attrs}>'
                 f'<span class="daynum">{d.day}</span>{gmd}</div>'
             )
+        week_rows.append(
+            f'<div class="week-row" style="background:{heat}">'
+            f'{"".join(day_cells)}</div>'
+        )
 
-    grid = "".join(day_cells)
     return (
         f'<section class="month-card" id="{anchor}">'
         f'<h2>{html.escape(label)} <span class="count-pill">{count} event'
         f'{"s" if count != 1 else ""}</span></h2>'
-        f'<div class="grid">{header_cells}{grid}</div>'
+        f'<div class="weekday-row">{header_cells}</div>'
+        f'<div class="weeks">{"".join(week_rows)}</div>'
         f'</section>'
     )
 
@@ -300,6 +329,9 @@ def build_legend() -> str:
         '<span class="legend-note">'
         '<span class="dash-sample"></span> dashed border = estimated from '
         'your RSVP date, not yet scraped</span>'
+        '<span class="legend-note">'
+        '<span class="heat-sample"></span> row shade = events that week '
+        '(darker → busier)</span>'
         '</div>'
     )
 
@@ -311,6 +343,11 @@ def build_html(events: list[dict], skipped: int) -> str:
         day_events.setdefault(ev["date"], []).append(ev)
 
     months = sorted({(d.year, d.month) for d in day_events})
+    max_week_count = max(
+        (sum(len(day_events.get(d, [])) for d in week if d)
+         for y, m in months for week in month_weeks(y, m)),
+        default=0,
+    )
 
     total_going = sum(ev["counts"]["going"] for ev in events)
     n_estimated = sum(1 for ev in events if ev["estimated"])
@@ -326,7 +363,7 @@ def build_html(events: list[dict], skipped: int) -> str:
     )
 
     month_cards = "".join(
-        build_month_card(y, m, day_events, today) for y, m in months
+        build_month_card(y, m, day_events, today, max_week_count) for y, m in months
     )
 
     if not months:
@@ -408,6 +445,11 @@ def build_html(events: list[dict], skipped: int) -> str:
     display: inline-block; width: 16px; height: 12px; border-radius: 3px;
     border: 1.5px dashed #9aa1ab; vertical-align: middle;
   }}
+  .heat-sample {{
+    display: inline-block; width: 40px; height: 12px; border-radius: 3px;
+    background: linear-gradient(to right, rgb(217,242,217), rgb(253,240,189), rgb(249,199,199));
+    vertical-align: middle;
+  }}
   .swatch {{
     border-radius: 4px; padding: 3px 9px; font-size: 0.72rem; font-weight: 600;
   }}
@@ -427,14 +469,19 @@ def build_html(events: list[dict], skipped: int) -> str:
     font-size: 0.66rem; font-weight: 500; color: var(--muted);
     background: #f0f1f3; border-radius: 999px; padding: 1px 7px;
   }}
-  .grid {{ display: grid; grid-template-columns: repeat(7, 1fr); gap: 3px; }}
+  .weekday-row {{ display: grid; grid-template-columns: repeat(7, 1fr); gap: 3px; margin-bottom: 2px; }}
   .wd {{ font-size: 0.6rem; color: var(--muted); text-align: center; padding-bottom: 2px; }}
+  .weeks {{ display: flex; flex-direction: column; gap: 3px; }}
+  .week-row {{
+    display: grid; grid-template-columns: repeat(7, 1fr); gap: 3px;
+    border-radius: 5px; padding: 2px;
+  }}
   .day {{
-    position: relative; height: 38px; border-radius: 5px;
-    background: #fbfbfc; border: 1px solid var(--border);
+    position: relative; height: 38px; border-radius: 4px;
+    background: transparent; border: 1px solid var(--border);
     padding: 2px; font-size: 0.6rem;
   }}
-  .day.empty {{ background: transparent; border-color: transparent; }}
+  .day.empty {{ background: var(--bg); border-color: transparent; }}
   .day.today {{ box-shadow: inset 0 0 0 2px var(--accent); }}
   .day.has-events {{ cursor: pointer; }}
   .day.has-events .daynum {{ color: #1a1a1a; font-weight: 600; }}
