@@ -57,6 +57,19 @@ GUEST_LABELS = {
     "interested": "Interested", "cant_go": "Can't Go",
 }
 
+# The compact per-day display only has room for three buckets.
+DAY_BUCKETS = ["going", "maybe", "cant_go"]
+BUCKET_COLOR = {"going": "#1a7a1a", "maybe": "#8a6d00", "cant_go": "#a10000"}
+BUCKET_BG = {"going": "#d9f2d9", "maybe": "#fdf0bd", "cant_go": "#f9d7d7"}
+
+# Your own RSVP status (CSV) collapsed into the same three buckets, so a
+# not-yet-scraped event still shows a meaningful (if 1-person) breakdown.
+CSV_STATUS_BUCKET = {
+    "GOING": "going", "APPROVED": "going",
+    "MAYBE": "maybe", "PENDING_APPROVAL": "maybe",
+    "DECLINED": "cant_go", "WITHDRAWN": "cant_go",
+}
+
 
 def parse_event_date(raw: str | None, scraped_at: str | None) -> date | None:
     """Parse fields['date'] into a real date.
@@ -137,6 +150,12 @@ def load_csv_events(csv_path: Path) -> dict[str, dict]:
         if ev_date is None:
             continue
         token = m.group(1)
+        status = str(row.get("status") or "").strip().upper()
+        plus_one = int(row.get("plus_one_count") or 0)
+        counts = {s: 0 for s in GUEST_STATUSES}
+        bucket = CSV_STATUS_BUCKET.get(status)
+        if bucket:
+            counts[bucket] = 1 + (plus_one if bucket == "going" else 0)
         out[token] = {
             "token": token,
             "title": str(row.get("title") or token),
@@ -146,11 +165,11 @@ def load_csv_events(csv_path: Path) -> dict[str, dict]:
             "host": "",
             "venue": "",
             "address": "",
-            "counts": {s: 0 for s in GUEST_STATUSES},
+            "counts": counts,
             "guests": {s: [] for s in GUEST_STATUSES},
             "estimated": True,
-            "your_status": str(row.get("status") or ""),
-            "plus_one_count": int(row.get("plus_one_count") or 0),
+            "your_status": status,
+            "plus_one_count": plus_one,
         }
     return out
 
@@ -216,24 +235,6 @@ def load_events(out_dir: Path) -> tuple[list[dict], int]:
     return events, skipped
 
 
-def color_for(value: int, max_value: int) -> str:
-    """rgb() on a green(0) -> yellow -> red(max) scale."""
-    if max_value <= 0 or value <= 0:
-        return "rgb(232,236,239)"
-    t = max(0.0, min(1.0, value / max_value))
-    if t < 0.5:
-        k = t / 0.5
-        r = int(144 + k * (255 - 144))
-        g = int(238 + k * (255 - 238))
-        b = int(144 + k * (0 - 144))
-    else:
-        k = (t - 0.5) / 0.5
-        r = int(255 + k * (220 - 255))
-        g = int(255 + k * (20 - 255))
-        b = int(0 + k * (60 - 0))
-    return f"rgb({r},{g},{b})"
-
-
 def month_weeks(year: int, month: int) -> list[list[date | None]]:
     """Weeks (Mon-first) for a month, with out-of-month days as None."""
     cal = Calendar(firstweekday=0)
@@ -244,7 +245,7 @@ def month_weeks(year: int, month: int) -> list[list[date | None]]:
 
 
 def build_month_card(year: int, month: int, day_events: dict[date, list[dict]],
-                      max_count: int, today: date) -> str:
+                      today: date) -> str:
     label = f"{_MONTH_NAMES[month - 1]} {year}"
     count = sum(len(day_events.get(d, [])) for week in month_weeks(year, month)
                 for d in week if d)
@@ -261,22 +262,22 @@ def build_month_card(year: int, month: int, day_events: dict[date, list[dict]],
             evs = day_events.get(d, [])
             n = len(evs)
             classes = "day"
-            style = ""
             attrs = f'data-date="{d.isoformat()}"'
             if d == today:
                 classes += " today"
+            gmd = ""
             if n:
                 classes += " has-events"
                 if all(ev["estimated"] for ev in evs):
                     classes += " estimated"
-                bg = color_for(n, max_count)
-                style = f' style="background:{bg}"'
                 attrs += ' tabindex="0" role="button"'
-            badge_text = f"~{n}" if n and all(ev["estimated"] for ev in evs) else str(n)
-            badge = f'<span class="badge">{badge_text}</span>' if n else ""
+                totals = {b: sum(ev["counts"][b] for ev in evs) for b in DAY_BUCKETS}
+                gmd = '<div class="gmd">' + "".join(
+                    f'<span class="{b}">{totals[b]}</span>' for b in DAY_BUCKETS
+                ) + '</div>'
             day_cells.append(
-                f'<div class="{classes}"{style} {attrs}>'
-                f'<span class="daynum">{d.day}</span>{badge}</div>'
+                f'<div class="{classes}" {attrs}>'
+                f'<span class="daynum">{d.day}</span>{gmd}</div>'
             )
 
     grid = "".join(day_cells)
@@ -289,23 +290,16 @@ def build_month_card(year: int, month: int, day_events: dict[date, list[dict]],
     )
 
 
-def build_legend(max_count: int) -> str:
-    steps = 5
-    swatches = []
-    for i in range(steps + 1):
-        v = round(max_count * i / steps) if max_count else 0
-        swatches.append(
-            f'<div class="swatch" style="background:{color_for(v, max_count)}">'
-            f'{v}</div>'
-        )
+def build_legend() -> str:
+    swatches = "".join(
+        f'<span class="swatch {b}">{GUEST_LABELS[b]}</span>' for b in DAY_BUCKETS
+    )
     return (
         '<div class="legend">'
-        '<span class="legend-label">Fewer events</span>'
-        f'{"".join(swatches)}'
-        '<span class="legend-label">More events</span>'
+        f'{swatches}'
         '<span class="legend-note">'
-        '<span class="dash-sample"></span> dashed + ~N = estimated from your '
-        'RSVP date, not yet scraped</span>'
+        '<span class="dash-sample"></span> dashed border = estimated from '
+        'your RSVP date, not yet scraped</span>'
         '</div>'
     )
 
@@ -316,7 +310,6 @@ def build_html(events: list[dict], skipped: int) -> str:
     for ev in events:
         day_events.setdefault(ev["date"], []).append(ev)
 
-    max_count = max((len(v) for v in day_events.values()), default=0)
     months = sorted({(d.year, d.month) for d in day_events})
 
     total_going = sum(ev["counts"]["going"] for ev in events)
@@ -333,7 +326,7 @@ def build_html(events: list[dict], skipped: int) -> str:
     )
 
     month_cards = "".join(
-        build_month_card(y, m, day_events, max_count, today) for y, m in months
+        build_month_card(y, m, day_events, today) for y, m in months
     )
 
     if not months:
@@ -409,51 +402,59 @@ def build_html(events: list[dict], skipped: int) -> str:
     color: var(--accent); text-decoration: none;
   }}
   nav.month-nav a:hover {{ border-color: var(--accent); }}
-  .legend {{ display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 4px 0 18px; }}
-  .legend-label {{ font-size: 0.78rem; color: var(--muted); }}
-  .legend-note {{ font-size: 0.75rem; color: var(--muted); margin-left: 10px; }}
+  .legend {{ display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 4px 0 16px; }}
+  .legend-note {{ font-size: 0.74rem; color: var(--muted); margin-left: 8px; }}
   .dash-sample {{
     display: inline-block; width: 16px; height: 12px; border-radius: 3px;
     border: 1.5px dashed #9aa1ab; vertical-align: middle;
   }}
   .swatch {{
-    width: 30px; height: 20px; border-radius: 4px; border: 1px solid rgba(0,0,0,0.08);
-    display: flex; align-items: center; justify-content: center;
-    font-size: 0.68rem; color: rgba(0,0,0,0.55);
+    border-radius: 4px; padding: 3px 9px; font-size: 0.72rem; font-weight: 600;
   }}
+  .swatch.going {{ background: #d9f2d9; color: #1a7a1a; }}
+  .swatch.maybe {{ background: #fdf0bd; color: #8a6d00; }}
+  .swatch.cant_go {{ background: #f9d7d7; color: #a10000; }}
+  .months-wrap {{ display: flex; flex-wrap: wrap; gap: 14px; }}
   .month-card {{
     background: var(--card); border: 1px solid var(--border);
-    border-radius: 12px; padding: 16px; margin-bottom: 20px;
-    max-width: 620px;
+    border-radius: 10px; padding: 10px; width: 250px; max-width: 100%;
   }}
   .month-card h2 {{
-    font-size: 1.05rem; margin: 0 0 10px;
-    display: flex; align-items: center; gap: 8px;
+    font-size: 0.88rem; margin: 0 0 8px;
+    display: flex; align-items: center; gap: 6px;
   }}
   .count-pill {{
-    font-size: 0.72rem; font-weight: 500; color: var(--muted);
-    background: #f0f1f3; border-radius: 999px; padding: 2px 9px;
+    font-size: 0.66rem; font-weight: 500; color: var(--muted);
+    background: #f0f1f3; border-radius: 999px; padding: 1px 7px;
   }}
-  .grid {{ display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }}
-  .wd {{ font-size: 0.7rem; color: var(--muted); text-align: center; padding-bottom: 4px; }}
+  .grid {{ display: grid; grid-template-columns: repeat(7, 1fr); gap: 3px; }}
+  .wd {{ font-size: 0.6rem; color: var(--muted); text-align: center; padding-bottom: 2px; }}
   .day {{
-    position: relative; aspect-ratio: 1; border-radius: 8px;
+    position: relative; height: 38px; border-radius: 5px;
     background: #fbfbfc; border: 1px solid var(--border);
-    padding: 4px 6px; font-size: 0.75rem;
+    padding: 2px; font-size: 0.6rem;
   }}
   .day.empty {{ background: transparent; border-color: transparent; }}
   .day.today {{ box-shadow: inset 0 0 0 2px var(--accent); }}
-  .day.has-events {{ cursor: pointer; color: #1a1a1a; font-weight: 600; }}
+  .day.has-events {{ cursor: pointer; }}
+  .day.has-events .daynum {{ color: #1a1a1a; font-weight: 600; }}
   .day.estimated {{ border-style: dashed; border-color: #9aa1ab; }}
   .day.has-events:hover, .day.has-events:focus {{
     outline: none; box-shadow: 0 0 0 2px var(--accent);
   }}
   .day.selected {{ box-shadow: 0 0 0 3px #1a1a1a; }}
-  .daynum {{ position: absolute; top: 4px; left: 6px; }}
-  .badge {{
-    position: absolute; bottom: 3px; right: 5px;
-    font-size: 0.68rem; opacity: 0.85;
+  .daynum {{ position: absolute; top: 2px; left: 3px; color: var(--muted); }}
+  .gmd {{
+    position: absolute; left: 2px; right: 2px; bottom: 2px;
+    display: flex; gap: 1px;
   }}
+  .gmd span {{
+    flex: 1; text-align: center; border-radius: 3px;
+    font-size: 0.5rem; line-height: 1.3; font-weight: 700;
+  }}
+  .gmd .going {{ background: #d9f2d9; color: #1a7a1a; }}
+  .gmd .maybe {{ background: #fdf0bd; color: #8a6d00; }}
+  .gmd .cant_go {{ background: #f9d7d7; color: #a10000; }}
   .empty-state {{ color: var(--muted); }}
   #detail-panel {{
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
@@ -499,9 +500,9 @@ def build_html(events: list[dict], skipped: int) -> str:
   {warning}
 
   <nav class="month-nav">{nav_links}</nav>
-  {build_legend(max_count)}
+  {build_legend()}
 
-  {month_cards}
+  <div class="months-wrap">{month_cards}</div>
 
   <div id="detail-panel" class="placeholder">
     Click a highlighted day to see event details.
