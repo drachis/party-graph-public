@@ -1,20 +1,27 @@
 """
 Self-contained event calendar.
 
-Populates the calendar in two layers, merged by Partiful event token:
+Two independent date layers, merged by Partiful token, each drawn as its own
+row of Going/Maybe/Can't Go counts on a day cell:
 
-1. data-request/rsvp_details.csv -- every event you've ever RSVP'd to, gives
-   instant (if approximate) coverage. Its 'rsvp_date' is when *you* RSVP'd,
-   not the event date, so these entries are placed on that date and flagged
-   "estimated" until the real thing is scraped.
-2. scraped_events/*.json (written by party_graph.pipeline) -- once a token
-   is scraped, its entry is replaced wholesale with the confirmed date,
-   venue, host, and full per-status guest lists.
+- RSVP layer (light colors): every row of data-request/rsvp_details.csv,
+  placed on the date *you RSVP'd*. Always available, instantly, for
+  everything you've ever RSVP'd to.
+- Event layer (bold colors): the *confirmed* event date, placed on its own
+  day once known -- from party_graph.pipeline's normal scrape (full
+  venue/host/guest-list detail) or from its lightweight --gather-dates pass
+  (date only, scraped_events/event_dates.json). Falls back to your own RSVP
+  status when only the date (not the guest list) is known.
 
-Each day with an event is colored/sized by event count on a green (fewest)
--> red (most) scale; clicking a highlighted day opens a detail panel with
-venue, host, RSVP counts, and guest names pulled straight from the scraped
-data (or your own RSVP status, for days not yet scraped).
+An event you RSVP'd to today for a party three months out shows up on
+*both* its own days -- a light mark today, a bold mark on the real date --
+rather than being guessed onto one date or the other. The week heatmap only
+counts the event layer, so batching RSVPs ("calendar management") never
+inflates it; it reflects how many confirmed parties actually land that week.
+
+Each week card also gets a small stats line: how many RSVPs you made that
+week, and (for the ones whose event date is now known) your average lead
+time -- how many days ahead of the event you RSVP'd.
 
 The page is pure HTML/CSS/JS with everything inlined -- no CDN, no plotly --
 so it renders identically online or off.
@@ -35,7 +42,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from party_graph.config import CSV_IN, OUT_DIR, TOKEN_RE
+from party_graph.config import CSV_IN, EVENT_DATES, OUT_DIR, TOKEN_RE
+from party_graph.utils import parse_rsvp_timestamp
 
 OUT = Path(__file__).parent / "event_calendar.html"
 
@@ -59,11 +67,10 @@ GUEST_LABELS = {
 
 # The compact per-day display only has room for three buckets.
 DAY_BUCKETS = ["going", "maybe", "cant_go"]
-BUCKET_COLOR = {"going": "#1a7a1a", "maybe": "#8a6d00", "cant_go": "#a10000"}
-BUCKET_BG = {"going": "#d9f2d9", "maybe": "#fdf0bd", "cant_go": "#f9d7d7"}
 
-# Your own RSVP status (CSV) collapsed into the same three buckets, so a
-# not-yet-scraped event still shows a meaningful (if 1-person) breakdown.
+# Your own RSVP status (CSV) collapsed into the same three buckets -- used
+# both for the RSVP-layer count and as the event-layer fallback when only
+# the date (not the guest list) is known.
 CSV_STATUS_BUCKET = {
     "GOING": "going", "APPROVED": "going",
     "MAYBE": "maybe", "PENDING_APPROVAL": "maybe",
@@ -71,13 +78,14 @@ CSV_STATUS_BUCKET = {
 }
 
 
-def parse_event_date(raw: str | None, scraped_at: str | None) -> date | None:
-    """Parse fields['date'] into a real date.
+def parse_event_date(raw: str | None, anchor_iso: str | None) -> date | None:
+    """Parse a Partiful date string into a real date.
 
     Handles an explicit year ("... Dec 29, 2025") and the year-omitted form
     Partiful uses for near-term events ("Saturday, Oct 24"), in which case
-    the year is inferred from scraped_at and rolled forward a year if the
-    resulting date would be more than 90 days in the past.
+    the year is inferred from anchor_iso (an ISO timestamp -- scraped_at)
+    and rolled forward a year if the resulting date would be more than 90
+    days in the past.
     """
     if not raw:
         return None
@@ -95,9 +103,9 @@ def parse_event_date(raw: str | None, scraped_at: str | None) -> date | None:
             return None
 
     anchor = None
-    if scraped_at:
+    if anchor_iso:
         try:
-            anchor = datetime.fromisoformat(scraped_at).date()
+            anchor = datetime.fromisoformat(anchor_iso).date()
         except ValueError:
             pass
     anchor = anchor or date.today()
@@ -110,29 +118,31 @@ def parse_event_date(raw: str | None, scraped_at: str | None) -> date | None:
     return candidate
 
 
-def parse_rsvp_timestamp(raw: object) -> date | None:
-    """Parse the CSV's 'rsvp_date', e.g. 'Sep 08, 2023 03:51:32 PM UTC'."""
-    if raw is None:
-        return None
-    s = str(raw).strip()
-    if not s:
-        return None
-    if s.endswith(" UTC"):
-        s = s[: -len(" UTC")]
-    try:
-        return datetime.strptime(s, "%b %d, %Y %I:%M:%S %p").date()
-    except ValueError:
-        return None
+def status_bucket_counts(status: str, plus_one: int) -> dict[str, int]:
+    """Collapse a CSV RSVP status (+ plus-ones) into the going/maybe/cant_go
+    buckets used everywhere a full guest-list breakdown isn't available."""
+    counts = {b: 0 for b in DAY_BUCKETS}
+    bucket = CSV_STATUS_BUCKET.get(status)
+    if bucket:
+        counts[bucket] = 1 + (plus_one if bucket == "going" else 0)
+    return counts
 
 
-def load_csv_events(csv_path: Path) -> dict[str, dict]:
-    """Return {token: event} from rsvp_details.csv, keyed by Partiful token.
+def blank_record(token: str, title: str, url: str) -> dict:
+    return {
+        "token": token, "title": title, "url": url,
+        "rsvp_date": None, "your_status": "", "plus_one_count": 0,
+        "light_counts": {b: 0 for b in DAY_BUCKETS},
+        "event_date": None, "event_source": None,
+        "bold_counts": {b: 0 for b in DAY_BUCKETS},
+        "full_counts": {s: 0 for s in GUEST_STATUSES},
+        "guests": {s: [] for s in GUEST_STATUSES},
+        "time": "", "host": "", "venue": "", "address": "",
+    }
 
-    Placeholder entries only: date is your RSVP timestamp (not the event
-    date), so there's no venue/host/guest breakdown yet -- just your own
-    status and plus-one count. Marked estimated=True; merge_events()
-    replaces any token also present in scraped_events/ with the real thing.
-    """
+
+def load_csv_rows(csv_path: Path) -> dict[str, dict]:
+    """token -> record, RSVP-layer fields filled in from rsvp_details.csv."""
     if not csv_path.exists():
         return {}
     df = pd.read_csv(csv_path)
@@ -146,61 +156,47 @@ def load_csv_events(csv_path: Path) -> dict[str, dict]:
         m = TOKEN_RE.search(url)
         if not m:
             continue
-        ev_date = parse_rsvp_timestamp(row.get("rsvp_date"))
-        if ev_date is None:
+        ts = parse_rsvp_timestamp(row.get("rsvp_date"))
+        if ts is None:
             continue
         token = m.group(1)
         status = str(row.get("status") or "").strip().upper()
         plus_one = int(row.get("plus_one_count") or 0)
-        counts = {s: 0 for s in GUEST_STATUSES}
-        bucket = CSV_STATUS_BUCKET.get(status)
-        if bucket:
-            counts[bucket] = 1 + (plus_one if bucket == "going" else 0)
-        out[token] = {
-            "token": token,
-            "title": str(row.get("title") or token),
-            "url": url,
-            "date": ev_date,
-            "time": "",
-            "host": "",
-            "venue": "",
-            "address": "",
-            "counts": counts,
-            "guests": {s: [] for s in GUEST_STATUSES},
-            "estimated": True,
-            "your_status": status,
-            "plus_one_count": plus_one,
-        }
+        rec = blank_record(token, str(row.get("title") or token), url)
+        rec["rsvp_date"] = ts.date()
+        rec["your_status"] = status
+        rec["plus_one_count"] = plus_one
+        rec["light_counts"] = status_bucket_counts(status, plus_one)
+        out[token] = rec
     return out
 
 
-def merge_events(csv_events: dict[str, dict], scraped_events: list[dict]) -> list[dict]:
-    """CSV rows populate the calendar first; a scraped entry for the same
-    token replaces it wholesale (confirmed date/venue/guests), carrying
-    forward the CSV's own RSVP status/plus-one if the scrape doesn't have it
-    (the scraped guest list is other guests, not your own RSVP)."""
-    merged = dict(csv_events)
-    for ev in scraped_events:
-        prior = merged.get(ev["token"], {})
-        ev = dict(ev)
-        ev["your_status"] = ev.get("your_status") or prior.get("your_status", "")
-        ev["plus_one_count"] = ev.get("plus_one_count") or prior.get("plus_one_count", 0)
-        merged[ev["token"]] = ev
-    return list(merged.values())
+def load_gathered_dates(path: Path) -> dict[str, dict]:
+    """token -> {title, url, raw_date, raw_time, scraped_at} written by
+    `scrape_events.py --gather-dates` (party_graph.pipeline.run_gather_dates)."""
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
 
 
-def load_events(out_dir: Path) -> tuple[list[dict], int]:
-    """Return (events, skipped_count) from every scraped_events/*.json."""
+def load_scraped_events(out_dir: Path) -> tuple[list[dict], int]:
+    """Return (events, skipped_count) from every scraped_events/*.json
+    (the full per-event scrape: fields + guest lists)."""
     events: list[dict] = []
     skipped = 0
     for p in sorted(out_dir.glob("*.json")):
-        if p.name == "scrape_state.json":
+        if p.name in ("scrape_state.json", EVENT_DATES.name):
             continue
         try:
             d = json.loads(p.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             skipped += 1
             continue
+        if "guests" not in d:
+            continue  # not a full per-event scrape file
 
         fields = d.get("fields", {}) or {}
         ev_date = parse_event_date(fields.get("date"), d.get("scraped_at"))
@@ -228,11 +224,58 @@ def load_events(out_dir: Path) -> tuple[list[dict], int]:
                 s: [g.get("name", "") for g in (guests.get(s, []) or [])]
                 for s in GUEST_STATUSES
             },
-            "estimated": False,
-            "your_status": "",
-            "plus_one_count": 0,
         })
     return events, skipped
+
+
+def build_records(csv_rows: dict[str, dict], gathered: dict[str, dict],
+                   scraped_list: list[dict]) -> dict[str, dict]:
+    """Merge all three sources into one record per token.
+
+    CSV supplies the RSVP layer. A gathered date fills in the event layer
+    with a status-based fallback count. A full scrape overrides the event
+    layer with the real guest-list breakdown -- richest source wins.
+    """
+    records = dict(csv_rows)
+
+    for token, g in gathered.items():
+        rec = records.setdefault(token, blank_record(token, g.get("title", token), g.get("url", "")))
+        ev_date = parse_event_date(g.get("raw_date"), g.get("scraped_at"))
+        if ev_date is None:
+            continue
+        rec["event_date"] = ev_date
+        rec["event_source"] = "gathered"
+        rec["time"] = g.get("raw_time", "") or rec["time"]
+        rec["bold_counts"] = status_bucket_counts(rec["your_status"], rec["plus_one_count"])
+        rec["full_counts"] = {**{s: 0 for s in GUEST_STATUSES}, **rec["bold_counts"]}
+
+    for ev in scraped_list:
+        rec = records.setdefault(ev["token"], blank_record(ev["token"], ev["title"], ev["url"]))
+        rec["title"] = ev["title"] or rec["title"]
+        rec["url"] = ev["url"] or rec["url"]
+        rec["event_date"] = ev["date"]
+        rec["event_source"] = "scraped"
+        rec["time"] = ev["time"]
+        rec["host"] = ev["host"]
+        rec["venue"] = ev["venue"]
+        rec["address"] = ev["address"]
+        rec["guests"] = ev["guests"]
+        rec["full_counts"] = ev["counts"]
+        rec["bold_counts"] = {b: ev["counts"][b] for b in DAY_BUCKETS}
+
+    return records
+
+
+def build_indices(records: dict[str, dict]) -> tuple[dict[date, list[dict]], dict[date, list[dict]]]:
+    """(rsvp_index, event_index): date -> records, for each layer."""
+    rsvp_idx: dict[date, list[dict]] = {}
+    event_idx: dict[date, list[dict]] = {}
+    for rec in records.values():
+        if rec["rsvp_date"]:
+            rsvp_idx.setdefault(rec["rsvp_date"], []).append(rec)
+        if rec["event_date"]:
+            event_idx.setdefault(rec["event_date"], []).append(rec)
+    return rsvp_idx, event_idx
 
 
 def month_weeks(year: int, month: int) -> list[list[date | None]]:
@@ -245,12 +288,9 @@ def month_weeks(year: int, month: int) -> list[list[date | None]]:
 
 
 def week_heat_color(value: int, max_value: int) -> str:
-    """Pastel green(0) -> yellow -> red(max) wash for a week row's background.
-
-    Uses the same three hues as the per-day Going/Maybe/Can't Go chips, just
-    lighter, so a busy week reads as a soft red band and a quiet one as soft
-    green, without drowning out the day numbers/chips drawn on top.
-    """
+    """Pastel green(0) -> yellow -> red(max) wash for a week row's
+    background, sized by confirmed *events* that week only (not RSVPs) --
+    so a day spent RSVPing to a backlog never inflates the heat."""
     if max_value <= 0 or value <= 0:
         return "transparent"
     t = max(0.0, min(1.0, value / max_value))
@@ -265,18 +305,36 @@ def week_heat_color(value: int, max_value: int) -> str:
     return "transparent"
 
 
-def build_month_card(year: int, month: int, day_events: dict[date, list[dict]],
-                      today: date, max_week_count: int) -> str:
+def week_stats(week: list[date | None], rsvp_idx: dict[date, list[dict]]) -> tuple[int, float | None]:
+    """(rsvp_count, avg_lead_days) for RSVPs made during this calendar week.
+    Lead time is (event_date - rsvp_date).days, averaged over just the
+    RSVPs in this week whose event date is now known."""
+    rsvp_count = 0
+    leads: list[int] = []
+    for d in week:
+        if d is None:
+            continue
+        for rec in rsvp_idx.get(d, []):
+            rsvp_count += 1
+            if rec["event_date"]:
+                leads.append((rec["event_date"] - rec["rsvp_date"]).days)
+    avg_lead = sum(leads) / len(leads) if leads else None
+    return rsvp_count, avg_lead
+
+
+def build_month_card(year: int, month: int, rsvp_idx: dict[date, list[dict]],
+                      event_idx: dict[date, list[dict]], today: date,
+                      max_week_count: int) -> str:
     label = f"{_MONTH_NAMES[month - 1]} {year}"
     weeks = month_weeks(year, month)
-    count = sum(len(day_events.get(d, [])) for week in weeks for d in week if d)
+    event_count = sum(len(event_idx.get(d, [])) for week in weeks for d in week if d)
     anchor = f"m-{year}-{month:02d}"
 
     header_cells = "".join(f'<div class="wd">{h}</div>' for h in _WEEKDAY_HEADERS)
 
-    week_rows = []
+    week_blocks = []
     for week in weeks:
-        week_total = sum(len(day_events.get(d, [])) for d in week if d)
+        week_total = sum(len(event_idx.get(d, [])) for d in week if d)
         heat = week_heat_color(week_total, max_week_count)
 
         day_cells = []
@@ -284,82 +342,94 @@ def build_month_card(year: int, month: int, day_events: dict[date, list[dict]],
             if d is None:
                 day_cells.append('<div class="day empty"></div>')
                 continue
-            evs = day_events.get(d, [])
-            n = len(evs)
+            rsvp_list = rsvp_idx.get(d, [])
+            event_list = event_idx.get(d, [])
             classes = "day"
             attrs = f'data-date="{d.isoformat()}"'
             if d == today:
                 classes += " today"
-            gmd = ""
-            est_mark = ""
-            if n:
+            rows_html = ""
+            if rsvp_list or event_list:
                 classes += " has-events"
-                if all(ev["estimated"] for ev in evs):
-                    classes += " estimated"
-                    est_mark = '<span class="est-mark">≈</span>'
-                    attrs += (' title="Estimated: placed on the date you RSVP\'d, '
-                              'not the confirmed event date -- scrape this event for the real date."')
                 attrs += ' tabindex="0" role="button"'
-                totals = {b: sum(ev["counts"][b] for ev in evs) for b in DAY_BUCKETS}
-                gmd = '<div class="gmd">' + "".join(
-                    f'<span class="{b}">{totals[b]}</span>' for b in DAY_BUCKETS
-                ) + '</div>'
+                rows = []
+                if rsvp_list:
+                    light = {b: sum(r["light_counts"][b] for r in rsvp_list) for b in DAY_BUCKETS}
+                    rows.append(
+                        '<div class="chip-row light">'
+                        + "".join(f'<span class="{b}">{light[b]}</span>' for b in DAY_BUCKETS)
+                        + '</div>'
+                    )
+                if event_list:
+                    bold = {b: sum(r["bold_counts"][b] for r in event_list) for b in DAY_BUCKETS}
+                    rows.append(
+                        '<div class="chip-row bold">'
+                        + "".join(f'<span class="{b}">{bold[b]}</span>' for b in DAY_BUCKETS)
+                        + '</div>'
+                    )
+                rows_html = '<div class="chips">' + "".join(rows) + '</div>'
             day_cells.append(
                 f'<div class="{classes}" {attrs}>'
-                f'<span class="daynum">{d.day}{est_mark}</span>{gmd}</div>'
+                f'<span class="daynum">{d.day}</span>{rows_html}</div>'
             )
-        week_rows.append(
+
+        rsvp_count, avg_lead = week_stats(week, rsvp_idx)
+        stats_html = ""
+        if rsvp_count:
+            lead_txt = f"{avg_lead:.0f}d avg lead" if avg_lead is not None else "lead: n/a"
+            stats_html = f'<div class="week-stats">{rsvp_count} RSVP{"s" if rsvp_count != 1 else ""} &middot; {lead_txt}</div>'
+
+        week_blocks.append(
             f'<div class="week-row" style="background:{heat}">'
-            f'{"".join(day_cells)}</div>'
+            f'{"".join(day_cells)}</div>{stats_html}'
         )
 
     return (
         f'<section class="month-card" id="{anchor}">'
-        f'<h2>{html.escape(label)} <span class="count-pill">{count} event'
-        f'{"s" if count != 1 else ""}</span></h2>'
+        f'<h2>{html.escape(label)} <span class="count-pill">{event_count} event'
+        f'{"s" if event_count != 1 else ""}</span></h2>'
         f'<div class="weekday-row">{header_cells}</div>'
-        f'<div class="weeks">{"".join(week_rows)}</div>'
+        f'<div class="weeks">{"".join(week_blocks)}</div>'
         f'</section>'
     )
 
 
 def build_legend() -> str:
-    swatches = "".join(
-        f'<span class="swatch {b}">{GUEST_LABELS[b]}</span>' for b in DAY_BUCKETS
-    )
+    light = "".join(f'<span class="swatch light {b}">{GUEST_LABELS[b]}</span>' for b in DAY_BUCKETS)
+    bold = "".join(f'<span class="swatch bold {b}">{GUEST_LABELS[b]}</span>' for b in DAY_BUCKETS)
     return (
         '<div class="legend">'
-        f'{swatches}'
+        f'<span class="legend-label">RSVP’d that day:</span>{light}'
+        f'<span class="legend-label">Event happens that day:</span>{bold}'
         '<span class="legend-note">'
-        '<span class="dash-sample"></span> dashed + ≈ = your RSVP date, '
-        '<strong>not</strong> the confirmed event date (not yet scraped)</span>'
-        '<span class="legend-note">'
-        '<span class="heat-sample"></span> row shade = events that week '
-        '(darker → busier)</span>'
+        '<span class="heat-sample"></span> row shade = confirmed events '
+        'that week (darker → busier; RSVPs never affect this)</span>'
         '</div>'
     )
 
 
-def build_html(events: list[dict], skipped: int) -> str:
+def build_html(records: dict[str, dict], skipped: int) -> str:
     today = date.today()
-    day_events: dict[date, list[dict]] = {}
-    for ev in events:
-        day_events.setdefault(ev["date"], []).append(ev)
+    rsvp_idx, event_idx = build_indices(records)
 
-    months = sorted({(d.year, d.month) for d in day_events})
+    months = sorted({(d.year, d.month) for d in rsvp_idx} | {(d.year, d.month) for d in event_idx})
     max_week_count = max(
-        (sum(len(day_events.get(d, [])) for d in week if d)
+        (sum(len(event_idx.get(d, [])) for d in week if d)
          for y, m in months for week in month_weeks(y, m)),
         default=0,
     )
 
-    total_going = sum(ev["counts"]["going"] for ev in events)
-    n_estimated = sum(1 for ev in events if ev["estimated"])
-    n_confirmed = len(events) - n_estimated
-    date_range = ""
-    if events:
-        lo, hi = min(day_events), max(day_events)
-        date_range = f"{lo.isoformat()} → {hi.isoformat()}"
+    n_tracked = len(records)
+    n_dated = sum(1 for r in records.values() if r["event_date"])
+    n_scraped_full = sum(1 for r in records.values() if r["event_source"] == "scraped")
+    total_going = sum(r["full_counts"].get("going", 0) for r in records.values() if r["event_date"])
+
+    rsvp_range = ""
+    if rsvp_idx:
+        rsvp_range = f"{min(rsvp_idx).isoformat()} → {max(rsvp_idx).isoformat()}"
+    event_range = ""
+    if event_idx:
+        event_range = f"{min(event_idx).isoformat()} → {max(event_idx).isoformat()}"
 
     nav_links = "".join(
         f'<a href="#m-{y}-{m:02d}">{_MONTH_NAMES[m - 1][:3]} {y}</a>'
@@ -367,50 +437,57 @@ def build_html(events: list[dict], skipped: int) -> str:
     )
 
     month_cards = "".join(
-        build_month_card(y, m, day_events, today, max_week_count) for y, m in months
+        build_month_card(y, m, rsvp_idx, event_idx, today, max_week_count) for y, m in months
     )
-
     if not months:
-        month_cards = '<p class="empty-state">No events with a parseable date were found.</p>'
+        month_cards = '<p class="empty-state">No RSVPs or events with a parseable date were found.</p>'
 
     # Data for the detail panel: keyed by ISO date, escaped/serialized as JSON
     # and read back via textContent (never innerHTML on raw strings), so
     # scraped guest/venue text can't inject markup.
-    events_by_date = {
+    rsvp_by_date = {
         d.isoformat(): [
             {
-                "title": ev["title"],
-                "url": ev["url"],
-                "time": ev["time"],
-                "host": ev["host"],
-                "venue": ev["venue"],
-                "address": ev["address"],
-                "counts": ev["counts"],
-                "guests": ev["guests"],
-                "estimated": ev["estimated"],
-                "your_status": ev["your_status"],
-                "plus_one_count": ev["plus_one_count"],
+                "title": r["title"], "url": r["url"],
+                "your_status": r["your_status"], "plus_one_count": r["plus_one_count"],
+                "event_date": r["event_date"].isoformat() if r["event_date"] else None,
             }
-            for ev in evs
+            for r in recs
         ]
-        for d, evs in day_events.items()
+        for d, recs in rsvp_idx.items()
     }
-    data_json = json.dumps(events_by_date, ensure_ascii=False).replace("</", "<\\/")
+    event_by_date = {
+        d.isoformat(): [
+            {
+                "title": r["title"], "url": r["url"], "time": r["time"],
+                "venue": r["venue"], "host": r["host"], "address": r["address"],
+                "counts": r["full_counts"], "guests": r["guests"],
+                "source": r["event_source"],
+                "your_status": r["your_status"], "plus_one_count": r["plus_one_count"],
+                "rsvp_date": r["rsvp_date"].isoformat() if r["rsvp_date"] else None,
+            }
+            for r in recs
+        ]
+        for d, recs in event_idx.items()
+    }
+    data_json = json.dumps({"rsvp": rsvp_by_date, "event": event_by_date},
+                            ensure_ascii=False).replace("</", "<\\/")
 
     warning = ""
     if skipped:
         warning = (
-            f'<p class="warning">{skipped} file(s) had no parseable event date '
-            "and were skipped.</p>"
+            f'<p class="warning">{skipped} file(s) in {OUT_DIR}/ had no '
+            "parseable event date and were skipped.</p>"
         )
-    if n_estimated:
+    n_undated = n_tracked - n_dated
+    if n_undated:
         warning += (
-            f'<p class="warning">⚠ {n_estimated} of {len(events)} event(s) below '
-            "are placed on the date <em>you RSVP'd</em>, not the confirmed event "
-            "date -- the CSV export has no event-date column. Days marked "
-            "≈ / dashed are guesses; scrape that event "
-            "(<code>python scrape_events.py --url &lt;link&gt; --now</code>) to pin "
-            "down its real date.</p>"
+            f'<p class="warning">{n_undated} of {n_tracked} tracked event(s) '
+            "have no confirmed date yet -- only their RSVP-day (light) mark "
+            "shows. Run <code>python scrape_events.py --gather-dates</code> "
+            "(date only, ~20-30s/page, never touches the guest list) or "
+            "<code>--url &lt;link&gt; --now</code> (full detail) to fill "
+            "them in.</p>"
         )
 
     return f"""<!doctype html>
@@ -454,11 +531,9 @@ def build_html(events: list[dict], skipped: int) -> str:
   }}
   nav.month-nav a:hover {{ border-color: var(--accent); }}
   .legend {{ display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 4px 0 16px; }}
-  .legend-note {{ font-size: 0.74rem; color: var(--muted); margin-left: 8px; }}
-  .dash-sample {{
-    display: inline-block; width: 16px; height: 12px; border-radius: 3px;
-    border: 1.5px dashed #9aa1ab; vertical-align: middle;
-  }}
+  .legend-label {{ font-size: 0.74rem; color: var(--muted); margin-left: 6px; }}
+  .legend-label:first-child {{ margin-left: 0; }}
+  .legend-note {{ font-size: 0.74rem; color: var(--muted); margin-left: 10px; }}
   .heat-sample {{
     display: inline-block; width: 40px; height: 12px; border-radius: 3px;
     background: linear-gradient(to right, rgb(217,242,217), rgb(253,240,189), rgb(249,199,199));
@@ -467,6 +542,7 @@ def build_html(events: list[dict], skipped: int) -> str:
   .swatch {{
     border-radius: 4px; padding: 3px 9px; font-size: 0.72rem; font-weight: 600;
   }}
+  .swatch.light {{ opacity: 0.6; font-weight: 500; }}
   .swatch.going {{ background: #d9f2d9; color: #1a7a1a; }}
   .swatch.maybe {{ background: #fdf0bd; color: #8a6d00; }}
   .swatch.cant_go {{ background: #f9d7d7; color: #a10000; }}
@@ -485,13 +561,17 @@ def build_html(events: list[dict], skipped: int) -> str:
   }}
   .weekday-row {{ display: grid; grid-template-columns: repeat(7, 1fr); gap: 3px; margin-bottom: 2px; }}
   .wd {{ font-size: 0.6rem; color: var(--muted); text-align: center; padding-bottom: 2px; }}
-  .weeks {{ display: flex; flex-direction: column; gap: 3px; }}
+  .weeks {{ display: flex; flex-direction: column; gap: 1px; }}
   .week-row {{
     display: grid; grid-template-columns: repeat(7, 1fr); gap: 3px;
     border-radius: 5px; padding: 2px;
   }}
+  .week-stats {{
+    font-size: 0.56rem; color: var(--muted); text-align: right;
+    padding: 1px 4px 4px;
+  }}
   .day {{
-    position: relative; height: 38px; border-radius: 4px;
+    position: relative; height: 46px; border-radius: 4px;
     background: transparent; border: 1px solid var(--border);
     padding: 2px; font-size: 0.6rem;
   }}
@@ -499,24 +579,25 @@ def build_html(events: list[dict], skipped: int) -> str:
   .day.today {{ box-shadow: inset 0 0 0 2px var(--accent); }}
   .day.has-events {{ cursor: pointer; }}
   .day.has-events .daynum {{ color: #1a1a1a; font-weight: 600; }}
-  .day.estimated {{ border-style: dashed; border-color: #9aa1ab; }}
   .day.has-events:hover, .day.has-events:focus {{
     outline: none; box-shadow: 0 0 0 2px var(--accent);
   }}
   .day.selected {{ box-shadow: 0 0 0 3px #1a1a1a; }}
   .daynum {{ position: absolute; top: 2px; left: 3px; color: var(--muted); }}
-  .est-mark {{ color: #8a5a00; font-weight: 700; margin-left: 1px; }}
-  .gmd {{
+  .chips {{
     position: absolute; left: 2px; right: 2px; bottom: 2px;
-    display: flex; gap: 1px;
+    display: flex; flex-direction: column; gap: 1px;
   }}
-  .gmd span {{
-    flex: 1; text-align: center; border-radius: 3px;
-    font-size: 0.5rem; line-height: 1.3; font-weight: 700;
+  .chip-row {{ display: flex; gap: 1px; }}
+  .chip-row span {{
+    flex: 1; text-align: center; border-radius: 2px;
+    line-height: 1.25; font-weight: 700;
   }}
-  .gmd .going {{ background: #d9f2d9; color: #1a7a1a; }}
-  .gmd .maybe {{ background: #fdf0bd; color: #8a6d00; }}
-  .gmd .cant_go {{ background: #f9d7d7; color: #a10000; }}
+  .chip-row.light span {{ font-size: 0.44rem; opacity: 0.62; font-weight: 600; }}
+  .chip-row.bold span {{ font-size: 0.56rem; opacity: 1; font-weight: 800; }}
+  .going {{ background: #d9f2d9; color: #1a7a1a; }}
+  .maybe {{ background: #fdf0bd; color: #8a6d00; }}
+  .cant_go {{ background: #f9d7d7; color: #a10000; }}
   .empty-state {{ color: var(--muted); }}
   #detail-panel {{
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
@@ -527,13 +608,17 @@ def build_html(events: list[dict], skipped: int) -> str:
   }}
   #detail-panel.placeholder {{ color: var(--muted); font-size: 0.88rem; }}
   #detail-panel h3 {{ margin: 0 0 4px; font-size: 1rem; }}
+  #detail-panel h4 {{
+    margin: 12px 0 4px; font-size: 0.8rem; text-transform: uppercase;
+    letter-spacing: 0.02em; color: var(--muted);
+  }}
   #detail-panel .event-block {{
-    padding: 10px 0; border-bottom: 1px solid var(--border);
+    padding: 8px 0; border-bottom: 1px solid var(--border);
   }}
   #detail-panel .event-block:last-child {{ border-bottom: none; }}
   #detail-panel .meta {{ color: var(--muted); font-size: 0.82rem; margin: 2px 0; }}
   #detail-panel a {{ color: var(--accent); }}
-  #detail-panel .estimated-note {{
+  #detail-panel .source-note {{
     color: #8a5a00; background: #fff6e0; border: 1px solid #f0d78a;
     border-radius: 6px; padding: 4px 8px; font-size: 0.78rem; margin: 4px 0;
   }}
@@ -550,15 +635,15 @@ def build_html(events: list[dict], skipped: int) -> str:
 </head>
 <body>
   <h1>Event Calendar</h1>
-  <p class="subtitle">Generated from rsvp_details.csv, enriched by scraped_events/*.json</p>
+  <p class="subtitle">RSVP layer from rsvp_details.csv, event layer from scraped_events/ (full scrape or --gather-dates)</p>
 
   <div class="summary-bar">
-    <span><strong>{len(events)}</strong> event(s)</span>
-    <span><strong>{n_confirmed}</strong> scraped in detail</span>
-    <span title="Placed on the date you RSVP'd -- not the confirmed event date">
-      <strong>{n_estimated}</strong> estimated from RSVP history</span>
-    <span><strong>{total_going}</strong> total going</span>
-    <span>Range: <strong>{date_range or "n/a"}</strong></span>
+    <span><strong>{n_tracked}</strong> tracked event(s)</span>
+    <span><strong>{n_dated}</strong> with a confirmed date</span>
+    <span><strong>{n_scraped_full}</strong> scraped in full</span>
+    <span><strong>{total_going}</strong> going (confirmed dates)</span>
+    <span>RSVP range: <strong>{rsvp_range or "n/a"}</strong></span>
+    <span>Event range: <strong>{event_range or "n/a"}</strong></span>
   </div>
   {warning}
 
@@ -568,7 +653,7 @@ def build_html(events: list[dict], skipped: int) -> str:
   <div class="months-wrap">{month_cards}</div>
 
   <div id="detail-panel" class="placeholder">
-    Click a highlighted day to see event details.
+    Click a highlighted day to see RSVP/event details.
   </div>
 
 <script id="event-data" type="application/json">{data_json}</script>
@@ -588,8 +673,78 @@ def build_html(events: list[dict], skipped: int) -> str:
     return e;
   }}
 
+  function renderEventBlock(ev) {{
+    const block = el('div', {{ cls: 'event-block' }});
+    const titleLine = ev.url ? el('a', {{ href: ev.url, text: ev.title }})
+                              : el('strong', {{ text: ev.title }});
+    const titleWrap = el('div');
+    titleWrap.appendChild(titleLine);
+    block.appendChild(titleWrap);
+
+    const metaParts = [ev.time, ev.venue, ev.address, ev.host ? 'Host: ' + ev.host : '']
+      .filter(Boolean);
+    if (metaParts.length) {{
+      block.appendChild(el('div', {{ cls: 'meta', text: metaParts.join(' \\u00b7 ') }}));
+    }}
+    if (ev.rsvp_date) {{
+      block.appendChild(el('div', {{ cls: 'meta', text: 'You RSVP\\u2019d on ' + ev.rsvp_date }}));
+    }}
+
+    if (ev.source === 'gathered') {{
+      block.appendChild(el('div', {{
+        cls: 'source-note',
+        text: 'Date confirmed, but guest list not yet scraped -- counts below are just your own RSVP.',
+      }}));
+    }}
+    if (ev.your_status) {{
+      const plusOne = ev.plus_one_count ? ' (+' + ev.plus_one_count + ')' : '';
+      block.appendChild(el('div', {{ cls: 'meta', text: 'Your RSVP: ' + ev.your_status + plusOne }}));
+    }}
+
+    const rsvp = el('div', {{ cls: 'rsvp-counts' }});
+    [['going', 'Going'], ['maybe', 'Maybe'], ['interested', 'Interested'], ['cant_go', "Can't Go"]]
+      .forEach(function (pair) {{
+        const n = (ev.counts || {{}})[pair[0]] || 0;
+        rsvp.appendChild(el('span', {{ text: pair[1] + ': ' + n }}));
+      }});
+    block.appendChild(rsvp);
+
+    ['going', 'maybe', 'interested', 'cant_go'].forEach(function (key) {{
+      const names = (ev.guests || {{}})[key] || [];
+      if (!names.length) return;
+      const d = document.createElement('details');
+      d.className = 'guest-list';
+      const s = document.createElement('summary');
+      s.textContent = names.length + ' ' + key.replace('_', ' ') + ' guest(s)';
+      d.appendChild(s);
+      const ul = document.createElement('ul');
+      names.forEach(function (name) {{ ul.appendChild(el('li', {{ text: name }})); }});
+      d.appendChild(ul);
+      block.appendChild(d);
+    }});
+    return block;
+  }}
+
+  function renderRsvpBlock(r) {{
+    const block = el('div', {{ cls: 'event-block' }});
+    const titleLine = r.url ? el('a', {{ href: r.url, text: r.title }})
+                             : el('strong', {{ text: r.title }});
+    const titleWrap = el('div');
+    titleWrap.appendChild(titleLine);
+    block.appendChild(titleWrap);
+
+    const plusOne = r.plus_one_count ? ' (+' + r.plus_one_count + ')' : '';
+    block.appendChild(el('div', {{ cls: 'meta', text: 'Your RSVP: ' + r.your_status + plusOne }}));
+    block.appendChild(el('div', {{
+      cls: 'meta',
+      text: r.event_date ? 'Happens ' + r.event_date : 'Event date not yet known',
+    }}));
+    return block;
+  }}
+
   function renderDay(iso) {{
-    const events = DATA[iso] || [];
+    const rsvps = DATA.rsvp[iso] || [];
+    const events = DATA.event[iso] || [];
     panel.innerHTML = '';
     panel.classList.remove('placeholder');
 
@@ -598,75 +753,28 @@ def build_html(events: list[dict], skipped: int) -> str:
     closeBtn.onclick = clearSelection;
     panel.appendChild(closeBtn);
 
-    const heading = el('h3', {{ text: new Date(iso + 'T00:00:00').toDateString() }});
-    panel.appendChild(heading);
+    panel.appendChild(el('h3', {{ text: new Date(iso + 'T00:00:00').toDateString() }}));
 
-    if (!events.length) {{
-      panel.appendChild(el('div', {{ cls: 'meta', text: 'No events on this day.' }}));
+    if (!rsvps.length && !events.length) {{
+      panel.appendChild(el('div', {{ cls: 'meta', text: 'Nothing on this day.' }}));
       return;
     }}
 
-    events.forEach(function (ev) {{
-      const block = el('div', {{ cls: 'event-block' }});
-
-      const titleLine = ev.url ? el('a', {{ href: ev.url, text: ev.title }})
-                                : el('strong', {{ text: ev.title }});
-      const titleWrap = el('div');
-      titleWrap.appendChild(titleLine);
-      block.appendChild(titleWrap);
-
-      const metaParts = [ev.time, ev.venue, ev.address, ev.host ? 'Host: ' + ev.host : '']
-        .filter(Boolean);
-      if (metaParts.length) {{
-        block.appendChild(el('div', {{ cls: 'meta', text: metaParts.join(' \\u00b7 ') }}));
-      }}
-
-      if (ev.estimated) {{
-        block.appendChild(el('div', {{
-          cls: 'estimated-note',
-          text: 'Date estimated from your RSVP timestamp \\u2014 run the scraper for the confirmed date/venue/guests.',
-        }}));
-      }}
-      if (ev.your_status) {{
-        const plusOne = ev.plus_one_count ? ' (+' + ev.plus_one_count + ')' : '';
-        block.appendChild(el('div', {{ cls: 'meta', text: 'Your RSVP: ' + ev.your_status + plusOne }}));
-      }}
-
-      if (!ev.estimated) {{
-        const rsvp = el('div', {{ cls: 'rsvp-counts' }});
-        [['going', 'Going'], ['maybe', 'Maybe'], ['interested', 'Interested'], ['cant_go', "Can't Go"]]
-          .forEach(function (pair) {{
-            const n = (ev.counts || {{}})[pair[0]] || 0;
-            rsvp.appendChild(el('span', {{ text: pair[1] + ': ' + n }}));
-          }});
-        block.appendChild(rsvp);
-      }}
-
-      ['going', 'maybe', 'interested', 'cant_go'].forEach(function (key) {{
-        const names = (ev.guests || {{}})[key] || [];
-        if (!names.length) return;
-        const d = document.createElement('details');
-        d.className = 'guest-list';
-        const s = document.createElement('summary');
-        s.textContent = names.length + ' ' + key.replace('_', ' ') + ' guest(s)';
-        d.appendChild(s);
-        const ul = document.createElement('ul');
-        names.forEach(function (name) {{
-          ul.appendChild(el('li', {{ text: name }}));
-        }});
-        d.appendChild(ul);
-        block.appendChild(d);
-      }});
-
-      panel.appendChild(block);
-    }});
+    if (events.length) {{
+      panel.appendChild(el('h4', {{ text: 'Event' + (events.length > 1 ? 's' : '') + ' happening this day' }}));
+      events.forEach(function (ev) {{ panel.appendChild(renderEventBlock(ev)); }});
+    }}
+    if (rsvps.length) {{
+      panel.appendChild(el('h4', {{ text: 'RSVP' + (rsvps.length > 1 ? 's' : '') + ' made this day' }}));
+      rsvps.forEach(function (r) {{ panel.appendChild(renderRsvpBlock(r)); }});
+    }}
   }}
 
   function clearSelection() {{
     if (selectedCell) selectedCell.classList.remove('selected');
     selectedCell = null;
     panel.classList.add('placeholder');
-    panel.textContent = 'Click a highlighted day to see event details.';
+    panel.textContent = 'Click a highlighted day to see RSVP/event details.';
   }}
 
   function selectDay(cell) {{
@@ -683,13 +791,15 @@ def build_html(events: list[dict], skipped: int) -> str:
     }});
   }});
 
-  // Auto-locate: jump to (and open) the event closest to today.
-  const isoDates = Object.keys(DATA);
-  if (isoDates.length) {{
+  // Auto-locate: jump to (and open) the confirmed event closest to today,
+  // falling back to the nearest RSVP if no event dates are known yet.
+  const eventDates = Object.keys(DATA.event);
+  const candidateDates = eventDates.length ? eventDates : Object.keys(DATA.rsvp);
+  if (candidateDates.length) {{
     const today = new Date();
-    let best = isoDates[0];
+    let best = candidateDates[0];
     let bestDiff = Infinity;
-    isoDates.forEach(function (iso) {{
+    candidateDates.forEach(function (iso) {{
       const diff = Math.abs(new Date(iso + 'T00:00:00') - today);
       if (diff < bestDiff) {{ bestDiff = diff; best = iso; }}
     }});
@@ -710,23 +820,23 @@ def main() -> None:
     if not CSV_IN.exists() and not OUT_DIR.exists():
         sys.exit(f"Neither {CSV_IN} nor {OUT_DIR}/ was found -- nothing to build a calendar from.")
 
-    csv_events = load_csv_events(CSV_IN)
-    scraped_events, skipped = load_events(OUT_DIR) if OUT_DIR.exists() else ([], 0)
-    events = merge_events(csv_events, scraped_events)
+    csv_rows = load_csv_rows(CSV_IN)
+    gathered = load_gathered_dates(EVENT_DATES)
+    scraped_list, skipped = load_scraped_events(OUT_DIR) if OUT_DIR.exists() else ([], 0)
+    records = build_records(csv_rows, gathered, scraped_list)
 
-    if not events:
-        print("No events with a parseable date found.")
-        if skipped:
-            print(f"({skipped} file(s) in {OUT_DIR}/ skipped: unparseable or missing date.)")
+    if not records:
+        print("No RSVPs or events found.")
 
-    html_doc = build_html(events, skipped)
+    html_doc = build_html(records, skipped)
     OUT.write_text(html_doc, encoding="utf-8")
     webbrowser.open(OUT.resolve().as_uri())
 
-    n_estimated = sum(1 for ev in events if ev["estimated"])
+    n_dated = sum(1 for r in records.values() if r["event_date"])
     print(f"Wrote {OUT} and opened in browser.")
-    print(f"{len(events)} event(s) across {len({e['date'] for e in events})} day(s) "
-          f"({len(events) - n_estimated} scraped in detail, {n_estimated} estimated from RSVP history).")
+    print(f"{len(records)} tracked event(s), {n_dated} with a confirmed date "
+          f"({sum(1 for r in records.values() if r['event_source'] == 'scraped')} scraped in full, "
+          f"{sum(1 for r in records.values() if r['event_source'] == 'gathered')} date-only).")
     if skipped:
         print(f"WARNING: {skipped} file(s) in {OUT_DIR}/ had no parseable event date and were skipped.")
 
