@@ -1,17 +1,18 @@
-﻿# Agent / harness config
+# Agent / harness config
 .continue/
 
-# Sensitive working data - do NOT commit (contains personal/PII)
+# This is the public tool repo -- it ships no personal data. data-request/
+# and scraped_events/ are just empty placeholders (see README.md) so the
+# expected layout exists on a fresh clone; if anything ever lands in them
+# locally (e.g. running the tool straight from here instead of pairing it
+# with a private data repo), keep it out of git.
 data-request/*
 !data-request/.gitkeep
-*.csv
-
-# Scraped output (private, regenerated)
 scraped_events/*
 !scraped_events/.gitkeep
-
-# Generated output
+*.csv
 event_calendar.html
+calendar_data.json
 
 # Python
 __pycache__/
@@ -19,3 +20,5 @@ __pycache__/
 .venv/
 venv/
 
+# Scratch logs
+*.log
