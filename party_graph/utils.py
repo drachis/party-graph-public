@@ -2,11 +2,18 @@
 from __future__ import annotations
 
 import threading
+from datetime import date as ddate
 from datetime import time as dtime
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, TypeVar
+from zoneinfo import ZoneInfo
 
 T = TypeVar("T")
+
+# Matches browser.py's configured timezone_id -- both the RSVP/host CSVs'
+# UTC timestamps and Partiful's own displayed event dates should agree
+# once converted to the same local zone.
+LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 
 
 def log(msg: str) -> None:
@@ -97,3 +104,20 @@ def parse_rsvp_timestamp(raw: object) -> datetime | None:
         return datetime.strptime(s, "%b %d, %Y %I:%M:%S %p")
     except ValueError:
         return None
+
+
+def parse_rsvp_local_date(raw: object) -> ddate | None:
+    """Like parse_rsvp_timestamp, but returns the LOCAL (America/Los_Angeles)
+    calendar date -- for placing something on a specific day, not just
+    sorting. The CSV timestamps are UTC; a Pacific evening RSVP or event
+    routinely falls on the *next* UTC day (e.g. "Dec 30, 2025 12:30 AM
+    UTC" is actually 4:30 PM Dec 29 in Los Angeles). Taking .date() on the
+    naive UTC value directly -- as if it barely mattered -- silently
+    misplaces roughly 40% of real rows by a full day. Use this, not
+    parse_rsvp_timestamp(...).date(), anywhere the result lands on a
+    calendar cell.
+    """
+    dt = parse_rsvp_timestamp(raw)
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=timezone.utc).astimezone(LOCAL_TZ).date()

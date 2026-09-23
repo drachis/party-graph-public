@@ -7,6 +7,7 @@ from pathlib import Path
 
 # --- Paths ---
 CSV_IN = Path("data-request/rsvp_details.csv")
+HOST_CSV_IN = Path("data-request/host_details.csv")  # events you host, not RSVP'd
 OUT_DIR = Path("scraped_events")
 SUMMARY = Path("scraped_events/summary.csv")
 STATE = Path("scraped_events/scrape_state.json")

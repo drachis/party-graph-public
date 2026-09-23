@@ -42,8 +42,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from party_graph.config import CSV_IN, EVENT_DATES, OUT_DIR, TOKEN_RE
-from party_graph.utils import parse_rsvp_timestamp
+from party_graph.config import CSV_IN, EVENT_DATES, HOST_CSV_IN, OUT_DIR, TOKEN_RE
+from party_graph.utils import parse_rsvp_local_date
 
 OUT = Path(__file__).parent / "event_calendar.html"
 
@@ -70,9 +70,11 @@ DAY_BUCKETS = ["going", "maybe", "cant_go"]
 
 # Your own RSVP status (CSV) collapsed into the same three buckets -- used
 # both for the RSVP-layer count and as the event-layer fallback when only
-# the date (not the guest list) is known.
+# the date (not the guest list) is known. HOSTING is synthetic (not a
+# Partiful status) -- host_details.csv has no per-status column, you're
+# just definitionally going to your own event.
 CSV_STATUS_BUCKET = {
-    "GOING": "going", "APPROVED": "going",
+    "GOING": "going", "APPROVED": "going", "HOSTING": "going",
     "MAYBE": "maybe", "PENDING_APPROVAL": "maybe",
     "DECLINED": "cant_go", "WITHDRAWN": "cant_go",
 }
@@ -156,18 +158,46 @@ def load_csv_rows(csv_path: Path) -> dict[str, dict]:
         m = TOKEN_RE.search(url)
         if not m:
             continue
-        ts = parse_rsvp_timestamp(row.get("rsvp_date"))
-        if ts is None:
+        rsvp_date = parse_rsvp_local_date(row.get("rsvp_date"))
+        if rsvp_date is None:
             continue
         token = m.group(1)
         status = str(row.get("status") or "").strip().upper()
         plus_one = int(row.get("plus_one_count") or 0)
         rec = blank_record(token, str(row.get("title") or token), url)
-        rec["rsvp_date"] = ts.date()
+        rec["rsvp_date"] = rsvp_date
         rec["your_status"] = status
         rec["plus_one_count"] = plus_one
         rec["light_counts"] = status_bucket_counts(status, plus_one)
         out[token] = rec
+    return out
+
+
+def load_hosted_events(csv_path: Path) -> dict[str, dict]:
+    """token -> {title, url, event_date} from host_details.csv -- events
+    *you* host. event_started_at is the real, authoritative event date
+    (no scrape/gather needed), and hosting counts as going."""
+    if not csv_path.exists():
+        return {}
+    df = pd.read_csv(csv_path)
+    required = {"event_title", "event_link", "event_started_at"}
+    if not required.issubset(df.columns):
+        return {}
+
+    out: dict[str, dict] = {}
+    for _, row in df.iterrows():
+        url = str(row.get("event_link", ""))
+        m = TOKEN_RE.search(url)
+        if not m:
+            continue
+        ev_date = parse_rsvp_local_date(row.get("event_started_at"))
+        if ev_date is None:
+            continue
+        out[m.group(1)] = {
+            "title": str(row.get("event_title") or m.group(1)),
+            "url": url,
+            "event_date": ev_date,
+        }
     return out
 
 
@@ -229,21 +259,35 @@ def load_scraped_events(out_dir: Path) -> tuple[list[dict], int]:
     return events, skipped
 
 
-def build_records(csv_rows: dict[str, dict], gathered: dict[str, dict],
-                   scraped_list: list[dict]) -> dict[str, dict]:
-    """Merge all three sources into one record per token.
+def build_records(csv_rows: dict[str, dict], hosted: dict[str, dict],
+                   gathered: dict[str, dict], scraped_list: list[dict]) -> dict[str, dict]:
+    """Merge all four sources into one record per token.
 
-    CSV supplies the RSVP layer. A gathered date fills in the event layer;
-    a full scrape overrides it with venue/host/guest-list detail -- richest
-    source wins. bold_counts (the compact calendar-view count) is always
-    your own RSVP response, regardless of source -- full_counts (the
+    CSV supplies the RSVP layer. host_details.csv marks a token as one you
+    host -- your_status becomes the synthetic HOSTING (always "going"),
+    and its event_started_at is already the real, authoritative event
+    date, no scrape/gather needed. A gathered date fills in the event
+    layer for anything left; a full scrape overrides it with venue/
+    host/guest-list detail -- richest source wins. bold_counts (the
+    compact calendar-view count) is always your own RSVP response
+    (going, if hosting) regardless of source -- full_counts (the
     detail-panel guest breakdown) is the only place the real guest list
     shows up, once scraped.
     """
     records = dict(csv_rows)
 
+    for token, h in hosted.items():
+        rec = records.setdefault(token, blank_record(token, h["title"], h["url"]))
+        rec["your_status"] = "HOSTING"
+        rec["event_date"] = h["event_date"]
+        rec["event_source"] = "hosted"
+        rec["bold_counts"] = status_bucket_counts("HOSTING", 0)
+        rec["full_counts"] = {**{s: 0 for s in GUEST_STATUSES}, **rec["bold_counts"]}
+
     for token, g in gathered.items():
         rec = records.setdefault(token, blank_record(token, g.get("title", token), g.get("url", "")))
+        if rec["event_source"] == "hosted":
+            continue  # host_details.csv's date is already authoritative
         ev_date = parse_event_date(g.get("raw_date"), g.get("scraped_at"))
         if ev_date is None:
             continue
@@ -728,7 +772,9 @@ def build_html(records: dict[str, dict], skipped: int) -> str:
         text: 'Date confirmed, but guest list not yet scraped -- counts below are just your own RSVP.',
       }}));
     }}
-    if (ev.your_status) {{
+    if (ev.your_status === 'HOSTING') {{
+      block.appendChild(el('div', {{ cls: 'meta', text: '\\ud83c\\udf89 You\\u2019re hosting this event' }}));
+    }} else if (ev.your_status) {{
       const plusOne = ev.plus_one_count ? ' (+' + ev.plus_one_count + ')' : '';
       block.appendChild(el('div', {{ cls: 'meta', text: 'Your RSVP: ' + ev.your_status + plusOne }}));
     }}
@@ -853,9 +899,10 @@ def main() -> None:
         sys.exit(f"Neither {CSV_IN} nor {OUT_DIR}/ was found -- nothing to build a calendar from.")
 
     csv_rows = load_csv_rows(CSV_IN)
+    hosted = load_hosted_events(HOST_CSV_IN)
     gathered = load_gathered_dates(EVENT_DATES)
     scraped_list, skipped = load_scraped_events(OUT_DIR) if OUT_DIR.exists() else ([], 0)
-    records = build_records(csv_rows, gathered, scraped_list)
+    records = build_records(csv_rows, hosted, gathered, scraped_list)
 
     if not records:
         print("No RSVPs or events found.")
@@ -865,10 +912,12 @@ def main() -> None:
     webbrowser.open(OUT.resolve().as_uri())
 
     n_dated = sum(1 for r in records.values() if r["event_date"])
+    n_hosted = sum(1 for r in records.values() if r["event_source"] == "hosted")
     print(f"Wrote {OUT} and opened in browser.")
     print(f"{len(records)} tracked event(s), {n_dated} with a confirmed date "
           f"({sum(1 for r in records.values() if r['event_source'] == 'scraped')} scraped in full, "
-          f"{sum(1 for r in records.values() if r['event_source'] == 'gathered')} date-only).")
+          f"{sum(1 for r in records.values() if r['event_source'] == 'gathered')} date-only, "
+          f"{n_hosted} hosted by you).")
     if skipped:
         print(f"WARNING: {skipped} file(s) in {OUT_DIR}/ had no parseable event date and were skipped.")
 
