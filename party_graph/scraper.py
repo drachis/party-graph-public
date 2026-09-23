@@ -5,7 +5,7 @@ from datetime import datetime
 
 from party_graph.browser import human_dwell, long_dwell
 from party_graph.config import GATHER_DWELL_MAX, GATHER_DWELL_MIN
-from party_graph.extract import extract, extract_fields, is_cancelled
+from party_graph.extract import extract, extract_fields, extract_title_from_body, is_cancelled
 from party_graph.utils import log
 
 # Phrases that mean "this is a challenge/block page", not a real Partiful
@@ -17,6 +17,20 @@ _BLOCK_SIGNS = (
     "rate limit", "verify you are human", "automated queries",
     "checking your browser", "cloudflare",
 )
+
+
+def _dump_debug_body(url: str, body: str) -> None:
+    """A real event page with no date match is a format our regexes don't
+    cover yet (not necessarily a block/failure) -- save the body so the
+    actual on-page text is available to fix the parser against, without
+    needing to re-visit the page."""
+    from pathlib import Path
+    from party_graph.config import TOKEN_RE, OUT_DIR
+    m = TOKEN_RE.search(url)
+    tok = m.group(1) if m else "unknown"
+    debug_dir = OUT_DIR / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    (debug_dir / f"{tok}.txt").write_text(body, encoding="utf-8")
 
 
 class BotDetected(Exception):
@@ -94,13 +108,17 @@ def gather_date_once(url: str, ctx) -> dict:
             "  return block ? block.innerText : '';"
             "}"
         )
+        title = extract_title_from_body(body) or title
         fields = extract_fields(body)
+        cancelled = is_cancelled(body)
+        if not fields.get("date") and not cancelled:
+            _dump_debug_body(url, body)
         return {
             "title": title,
             "url": url,
             "raw_date": fields.get("date", ""),
             "raw_time": fields.get("time", ""),
-            "cancelled": is_cancelled(body),
+            "cancelled": cancelled,
             "scraped_at": datetime.now().isoformat(),
         }
     finally:

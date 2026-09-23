@@ -50,11 +50,37 @@ TOKEN_RE = re.compile(r"partiful\.com/e/([A-Za-z0-9_-]+)")
 RSPV_STATS_RE = re.compile(
     r"(\d+)\s*Going\s*\u00b7\s*(\d+)\s*Interested\s*\u00b7\s*(\d+)\s*Maybe"
 )
+# Partiful appends ", YYYY" when the date isn't in the current year window
+# (e.g. past events from prior years) -- year suffix is optional here.
 DATE_RE = re.compile(
     r"^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s+"
-    r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{1,2}$"
+    r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{1,2}(,\s+\d{4})?$"
 )
-TIME_RE = re.compile(r"^\d{1,2}(:\d{2})?\s*(AM|PM|am|pm)\s*$")
+# Single time ("8:00pm") or a start-end range ("4:30pm – 9:00pm").
+TIME_RE = re.compile(
+    r"^\d{1,2}(:\d{2})?\s*(AM|PM|am|pm)"
+    r"(\s*[–-]\s*\d{1,2}(:\d{2})?\s*(AM|PM|am|pm))?\s*$"
+)
+
+# Multi-day events render their date as two lines instead of one, with an
+# abbreviated weekday and the time inline (middot-separated), e.g.:
+#   "Fri, Sep 11 · 7:00pm —"
+#   "Sun, Sep 13 · 10:00pm"
+# Distinct enough from DATE_RE/TIME_RE (full weekday name, date and time on
+# separate lines) that it needs its own pair of patterns rather than a tweak
+# to those. We only care about the start (first line) for the "date"/"time"
+# fields; MULTIDAY_END_RE just lets the second line be recognized and
+# skipped instead of leaking into the description.
+_MULTIDAY_WEEKDAY = r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)"
+_MULTIDAY_MONTH = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*"
+_MULTIDAY_TIME = r"\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)"
+MULTIDAY_START_RE = re.compile(
+    rf"^({_MULTIDAY_WEEKDAY},\s+{_MULTIDAY_MONTH}\s+\d{{1,2}})"
+    rf"\s*·\s*({_MULTIDAY_TIME})\s*[–—-]\s*$"
+)
+MULTIDAY_END_RE = re.compile(
+    rf"^{_MULTIDAY_WEEKDAY},\s+{_MULTIDAY_MONTH}\s+\d{{1,2}}\s*·\s*{_MULTIDAY_TIME}\s*$"
+)
 HOST_MARKER = re.compile(r"^Hosted by\s*$")
 GUEST_MARKER = re.compile(r"^Guest List\s*$")
 ADDR_RE = re.compile(r"\b(St\.|Ave\.|Dr\.|Blvd\.|Rd\.|Ln\.|Way|Pl\.|Pkwy\.)\b")

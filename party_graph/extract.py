@@ -13,6 +13,8 @@ from party_graph.config import (
     GUEST_MARKER,
     GUEST_ROW_RE,
     HOST_MARKER,
+    MULTIDAY_END_RE,
+    MULTIDAY_START_RE,
     RSPV_STATS_RE,
     TIME_RE,
 )
@@ -61,6 +63,24 @@ def parse_guests_from_text(body: str) -> dict:
     return guests
 
 
+def extract_title_from_body(body: str) -> str:
+    """Recover the full event title from body text.
+
+    Partiful's <title> tag gets silently truncated (sometimes mid-character,
+    producing a stray U+FFFD replacement char), but body text is never
+    length-limited and the title always sits on the line right before the
+    date line, e.g. "...\nBirthday Brews\nMonday, Dec 29, 2025\n...".
+    Returns "" if no date line (and thus no reliable title line) is found.
+    """
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    for i, line in enumerate(lines):
+        if i > 0 and (DATE_RE.match(line) or MULTIDAY_START_RE.match(line)):
+            candidate = lines[i - 1]
+            if candidate not in _BOILERPLATE:
+                return candidate
+    return ""
+
+
 def extract_fields(body: str) -> dict[str, str]:
     """Walk the body text line-by-line, tracking section context.
 
@@ -79,9 +99,17 @@ def extract_fields(body: str) -> dict[str, str]:
 
     in_host = False
     in_venue = False
+    expect_multiday_end = False
     description_parts: list[str] = []
 
     for line in lines:
+        if expect_multiday_end:
+            expect_multiday_end = False
+            if MULTIDAY_END_RE.match(line):
+                continue
+            # Not the expected second line after all -- fall through and
+            # let normal handling look at it.
+
         if line in _BOILERPLATE or line.startswith("We use cookies"):
             if line.startswith("We use cookies"):
                 break
@@ -112,6 +140,16 @@ def extract_fields(body: str) -> dict[str, str]:
         # Guest list marker ends the metadata zone
         if GUEST_MARKER.match(line):
             break
+
+        # Multi-day event header: date+time on one line, weekday abbreviated,
+        # continues onto a second line we then skip (see expect_multiday_end
+        # above). Only the start is kept.
+        m = MULTIDAY_START_RE.match(line)
+        if m:
+            fields.setdefault("date", m.group(1))
+            fields.setdefault("time", m.group(2))
+            expect_multiday_end = True
+            continue
 
         # Date
         if DATE_RE.match(line):
@@ -161,6 +199,7 @@ def extract(page) -> dict:
 
     if title.endswith(" | Partiful"):
         title = title[:-11].strip()
+    title = extract_title_from_body(body) or title
 
     fields = extract_fields(body)
     guests = parse_guests_from_text(body)

@@ -221,9 +221,18 @@ def run_gather_dates(args: argparse.Namespace) -> None:
     log(f"gather-dates: {len(all_tokens)} unique CSV event(s)")
 
     known = load_event_dates()
+
+    def is_done(tok: str) -> bool:
+        # A cached entry only counts as done if it actually found a date,
+        # or the event is confirmed cancelled (no date to find). An empty
+        # raw_date otherwise means a prior regex miss/failure -- eligible
+        # for retry rather than stuck forever.
+        entry = known.get(tok)
+        return bool(entry and (entry.get("raw_date") or entry.get("cancelled")))
+
     todo = [
         (tok, url) for tok, url in all_tokens
-        if tok not in known and not event_path(tok).exists()
+        if not is_done(tok) and not event_path(tok).exists()
     ]
     if args.limit:
         todo = todo[: args.limit]
