@@ -337,6 +337,14 @@ def month_weeks(year: int, month: int) -> list[list[date | None]]:
     ]
 
 
+def counts_toward_heat(rec: dict) -> bool:
+    """A confirmed event counts toward week/month heat unless it's
+    cancelled or you declined it. Heat measures events you did or might
+    attend, not everything you were ever invited to -- an event you said
+    no to isn't part of "how busy is my week"."""
+    return not rec["cancelled"] and rec["bold_counts"]["cant_go"] == 0
+
+
 def week_heat_color(value: int, max_value: int) -> str:
     """Pastel green(0) -> yellow -> red(max) wash for a week row's
     background, sized by confirmed *events* that week only (not RSVPs) --
@@ -377,11 +385,9 @@ def build_month_card(year: int, month: int, rsvp_idx: dict[date, list[dict]],
                       max_week_count: int) -> str:
     label = f"{_MONTH_NAMES[month - 1]} {year}"
     weeks = month_weeks(year, month)
-    # Cancelled events don't count toward "how busy is this week/month" --
-    # they're not actually happening anymore.
     event_count = sum(
         1 for week in weeks for d in week if d
-        for r in event_idx.get(d, []) if not r["cancelled"]
+        for r in event_idx.get(d, []) if counts_toward_heat(r)
     )
     anchor = f"m-{year}-{month:02d}"
 
@@ -390,7 +396,7 @@ def build_month_card(year: int, month: int, rsvp_idx: dict[date, list[dict]],
     week_blocks = []
     for week in weeks:
         week_total = sum(
-            1 for d in week if d for r in event_idx.get(d, []) if not r["cancelled"]
+            1 for d in week if d for r in event_idx.get(d, []) if counts_toward_heat(r)
         )
         heat = week_heat_color(week_total, max_week_count)
 
@@ -464,8 +470,8 @@ def build_legend() -> str:
         f'<span class="legend-label">RSVP’d that day:</span>{light}'
         f'<span class="legend-label">Event happens that day:</span>{bold}'
         '<span class="legend-note">'
-        '<span class="heat-sample"></span> row shade = confirmed events '
-        'that week (darker → busier; RSVPs never affect this)</span>'
+        '<span class="heat-sample"></span> row shade = events you’re going/maybe '
+        'going to that week (darker → busier; declined, cancelled, and RSVPs never count)</span>'
         '<span class="legend-note">'
         '<span class="cancel-mark">✕</span> = event cancelled</span>'
         '</div>'
@@ -478,7 +484,7 @@ def build_html(records: dict[str, dict], skipped: int) -> str:
 
     months = sorted({(d.year, d.month) for d in rsvp_idx} | {(d.year, d.month) for d in event_idx})
     max_week_count = max(
-        (sum(len(event_idx.get(d, [])) for d in week if d)
+        (sum(1 for d in week if d for r in event_idx.get(d, []) if counts_toward_heat(r))
          for y, m in months for week in month_weeks(y, m)),
         default=0,
     )
