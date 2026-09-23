@@ -5,7 +5,7 @@ from datetime import datetime
 
 from party_graph.browser import human_dwell, long_dwell
 from party_graph.config import GATHER_DWELL_MAX, GATHER_DWELL_MIN
-from party_graph.extract import extract, extract_fields
+from party_graph.extract import extract, extract_fields, is_cancelled
 from party_graph.utils import log
 
 # Phrases that mean "this is a challenge/block page", not a real Partiful
@@ -100,6 +100,7 @@ def gather_date_once(url: str, ctx) -> dict:
             "url": url,
             "raw_date": fields.get("date", ""),
             "raw_time": fields.get("time", ""),
+            "cancelled": is_cancelled(body),
             "scraped_at": datetime.now().isoformat(),
         }
     finally:

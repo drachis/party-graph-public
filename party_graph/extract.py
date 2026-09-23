@@ -29,6 +29,17 @@ _BOILERPLATE = {
 
 _TZ_RE = re.compile(r"^(ET|PT|CT|MT|PST|PDT|EST|EDT|CST|CDT|MST|MDT|GMT|UTC)$")
 
+# Partiful shows a banner near the top of a cancelled event's page (e.g.
+# "This event has been cancelled"). Checked against the whole body rather
+# than folded into extract_fields()'s line-by-line walk, since we don't
+# know exactly where the banner sits relative to the fields it tracks.
+_CANCELLED_RE = re.compile(r"\bcancell?ed\b", re.I)
+
+
+def is_cancelled(body: str) -> bool:
+    """Heuristic: does this page look like a cancelled event?"""
+    return bool(_CANCELLED_RE.search(body))
+
 
 def parse_guests_from_text(body: str) -> dict:
     """Extract guest names + status + date from the page body text."""
@@ -153,5 +164,7 @@ def extract(page) -> dict:
 
     fields = extract_fields(body)
     guests = parse_guests_from_text(body)
+    cancelled = is_cancelled(body)
 
-    return {"title": title, "body": body, "fields": fields, "guests": guests}
+    return {"title": title, "body": body, "fields": fields, "guests": guests,
+            "cancelled": cancelled}

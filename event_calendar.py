@@ -133,7 +133,7 @@ def blank_record(token: str, title: str, url: str) -> dict:
         "token": token, "title": title, "url": url,
         "rsvp_date": None, "your_status": "", "plus_one_count": 0,
         "light_counts": {b: 0 for b in DAY_BUCKETS},
-        "event_date": None, "event_source": None,
+        "event_date": None, "event_source": None, "cancelled": False,
         "bold_counts": {b: 0 for b in DAY_BUCKETS},
         "full_counts": {s: 0 for s in GUEST_STATUSES},
         "guests": {s: [] for s in GUEST_STATUSES},
@@ -224,6 +224,7 @@ def load_scraped_events(out_dir: Path) -> tuple[list[dict], int]:
                 s: [g.get("name", "") for g in (guests.get(s, []) or [])]
                 for s in GUEST_STATUSES
             },
+            "cancelled": bool(d.get("cancelled", False)),
         })
     return events, skipped
 
@@ -232,9 +233,12 @@ def build_records(csv_rows: dict[str, dict], gathered: dict[str, dict],
                    scraped_list: list[dict]) -> dict[str, dict]:
     """Merge all three sources into one record per token.
 
-    CSV supplies the RSVP layer. A gathered date fills in the event layer
-    with a status-based fallback count. A full scrape overrides the event
-    layer with the real guest-list breakdown -- richest source wins.
+    CSV supplies the RSVP layer. A gathered date fills in the event layer;
+    a full scrape overrides it with venue/host/guest-list detail -- richest
+    source wins. bold_counts (the compact calendar-view count) is always
+    your own RSVP response, regardless of source -- full_counts (the
+    detail-panel guest breakdown) is the only place the real guest list
+    shows up, once scraped.
     """
     records = dict(csv_rows)
 
@@ -246,6 +250,7 @@ def build_records(csv_rows: dict[str, dict], gathered: dict[str, dict],
         rec["event_date"] = ev_date
         rec["event_source"] = "gathered"
         rec["time"] = g.get("raw_time", "") or rec["time"]
+        rec["cancelled"] = bool(g.get("cancelled", False))
         rec["bold_counts"] = status_bucket_counts(rec["your_status"], rec["plus_one_count"])
         rec["full_counts"] = {**{s: 0 for s in GUEST_STATUSES}, **rec["bold_counts"]}
 
@@ -260,8 +265,9 @@ def build_records(csv_rows: dict[str, dict], gathered: dict[str, dict],
         rec["venue"] = ev["venue"]
         rec["address"] = ev["address"]
         rec["guests"] = ev["guests"]
+        rec["cancelled"] = ev["cancelled"]
         rec["full_counts"] = ev["counts"]
-        rec["bold_counts"] = {b: ev["counts"][b] for b in DAY_BUCKETS}
+        rec["bold_counts"] = status_bucket_counts(rec["your_status"], rec["plus_one_count"])
 
     return records
 
@@ -327,14 +333,21 @@ def build_month_card(year: int, month: int, rsvp_idx: dict[date, list[dict]],
                       max_week_count: int) -> str:
     label = f"{_MONTH_NAMES[month - 1]} {year}"
     weeks = month_weeks(year, month)
-    event_count = sum(len(event_idx.get(d, [])) for week in weeks for d in week if d)
+    # Cancelled events don't count toward "how busy is this week/month" --
+    # they're not actually happening anymore.
+    event_count = sum(
+        1 for week in weeks for d in week if d
+        for r in event_idx.get(d, []) if not r["cancelled"]
+    )
     anchor = f"m-{year}-{month:02d}"
 
     header_cells = "".join(f'<div class="wd">{h}</div>' for h in _WEEKDAY_HEADERS)
 
     week_blocks = []
     for week in weeks:
-        week_total = sum(len(event_idx.get(d, [])) for d in week if d)
+        week_total = sum(
+            1 for d in week if d for r in event_idx.get(d, []) if not r["cancelled"]
+        )
         heat = week_heat_color(week_total, max_week_count)
 
         day_cells = []
@@ -344,6 +357,7 @@ def build_month_card(year: int, month: int, rsvp_idx: dict[date, list[dict]],
                 continue
             rsvp_list = rsvp_idx.get(d, [])
             event_list = event_idx.get(d, [])
+            all_cancelled = bool(event_list) and all(r["cancelled"] for r in event_list)
             classes = "day"
             attrs = f'data-date="{d.isoformat()}"'
             if d == today:
@@ -352,6 +366,9 @@ def build_month_card(year: int, month: int, rsvp_idx: dict[date, list[dict]],
             if rsvp_list or event_list:
                 classes += " has-events"
                 attrs += ' tabindex="0" role="button"'
+                if all_cancelled:
+                    classes += " cancelled"
+                    attrs += ' title="This event was cancelled"'
                 rows = []
                 if rsvp_list:
                     light = {b: sum(r["light_counts"][b] for r in rsvp_list) for b in DAY_BUCKETS}
@@ -368,9 +385,10 @@ def build_month_card(year: int, month: int, rsvp_idx: dict[date, list[dict]],
                         + '</div>'
                     )
                 rows_html = '<div class="chips">' + "".join(rows) + '</div>'
+            cancel_mark = '<span class="cancel-mark">✕</span>' if all_cancelled else ""
             day_cells.append(
                 f'<div class="{classes}" {attrs}>'
-                f'<span class="daynum">{d.day}</span>{rows_html}</div>'
+                f'<span class="daynum">{d.day}{cancel_mark}</span>{rows_html}</div>'
             )
 
         rsvp_count, avg_lead = week_stats(week, rsvp_idx)
@@ -404,6 +422,8 @@ def build_legend() -> str:
         '<span class="legend-note">'
         '<span class="heat-sample"></span> row shade = confirmed events '
         'that week (darker → busier; RSVPs never affect this)</span>'
+        '<span class="legend-note">'
+        '<span class="cancel-mark">✕</span> = event cancelled</span>'
         '</div>'
     )
 
@@ -462,7 +482,7 @@ def build_html(records: dict[str, dict], skipped: int) -> str:
                 "title": r["title"], "url": r["url"], "time": r["time"],
                 "venue": r["venue"], "host": r["host"], "address": r["address"],
                 "counts": r["full_counts"], "guests": r["guests"],
-                "source": r["event_source"],
+                "source": r["event_source"], "cancelled": r["cancelled"],
                 "your_status": r["your_status"], "plus_one_count": r["plus_one_count"],
                 "rsvp_date": r["rsvp_date"].isoformat() if r["rsvp_date"] else None,
             }
@@ -583,7 +603,10 @@ def build_html(records: dict[str, dict], skipped: int) -> str:
     outline: none; box-shadow: 0 0 0 2px var(--accent);
   }}
   .day.selected {{ box-shadow: 0 0 0 3px #1a1a1a; }}
+  .day.cancelled {{ border-style: dashed; border-color: #c94b4b; }}
+  .day.cancelled .chip-row.bold span {{ text-decoration: line-through; opacity: 0.5; }}
   .daynum {{ position: absolute; top: 2px; left: 3px; color: var(--muted); }}
+  .cancel-mark {{ color: #c94b4b; font-weight: 700; margin-left: 1px; }}
   .chips {{
     position: absolute; left: 2px; right: 2px; bottom: 2px;
     display: flex; flex-direction: column; gap: 1px;
@@ -621,6 +644,11 @@ def build_html(records: dict[str, dict], skipped: int) -> str:
   #detail-panel .source-note {{
     color: #8a5a00; background: #fff6e0; border: 1px solid #f0d78a;
     border-radius: 6px; padding: 4px 8px; font-size: 0.78rem; margin: 4px 0;
+  }}
+  #detail-panel .cancelled-note {{
+    color: #a10000; background: #fdeaea; border: 1px solid #f0b8b8;
+    border-radius: 6px; padding: 4px 8px; font-size: 0.8rem; margin: 4px 0;
+    font-weight: 600;
   }}
   .rsvp-counts {{ display: flex; gap: 12px; margin: 6px 0; font-size: 0.8rem; }}
   .rsvp-counts span {{ background: #f0f1f3; border-radius: 6px; padding: 2px 8px; }}
@@ -680,6 +708,10 @@ def build_html(records: dict[str, dict], skipped: int) -> str:
     const titleWrap = el('div');
     titleWrap.appendChild(titleLine);
     block.appendChild(titleWrap);
+
+    if (ev.cancelled) {{
+      block.appendChild(el('div', {{ cls: 'cancelled-note', text: '\\u2715 This event was cancelled' }}));
+    }}
 
     const metaParts = [ev.time, ev.venue, ev.address, ev.host ? 'Host: ' + ev.host : '']
       .filter(Boolean);
