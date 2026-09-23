@@ -27,6 +27,10 @@ GATHER_LONG_PAUSE_MAX = 100.0
 # Stop the run if this many pages in a row come back dateless -- more
 # likely a soft block than that many individually-restricted events.
 GATHER_EMPTY_STREAK_LIMIT = 3
+# Hard wall-clock ceiling on one page visit (nav + dwell + read), well
+# above GATHER_DWELL_MAX -- catches a wedged/frozen tab that Playwright's
+# own per-call timeouts don't (page.evaluate() has none of its own).
+GATHER_HARD_TIMEOUT = 120.0
 
 # --- Pacing ---
 MIN_DAILY = 8

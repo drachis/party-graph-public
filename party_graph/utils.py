@@ -1,8 +1,12 @@
 """Small shared utilities."""
 from __future__ import annotations
 
+import threading
 from datetime import time as dtime
 from datetime import datetime
+from typing import Callable, TypeVar
+
+T = TypeVar("T")
 
 
 def log(msg: str) -> None:
@@ -12,6 +16,46 @@ def log(msg: str) -> None:
 def parse_hhmm(s: str) -> dtime:
     h, m = s.split(":")
     return dtime(int(h), int(m))
+
+
+def run_with_timeout(fn: Callable[[], T], timeout: float,
+                      on_timeout: Callable[[], None] | None = None) -> T:
+    """Run fn() with a hard wall-clock ceiling, for calls that can hang
+    with no timeout of their own.
+
+    Seen in practice: a Playwright tab silently landed on about:blank and
+    sat there -- page.evaluate() has no built-in timeout, so nothing in
+    the normal call chain ever raised, and it looked frozen until someone
+    closed the browser by hand. fn() runs in a daemon worker thread; if it
+    hasn't returned within `timeout` seconds, on_timeout() is called
+    (expected to forcibly tear something down -- e.g. close the browser
+    context -- so the blocked call unblocks with an exception) and we wait
+    a short grace period for it to actually unwind. Raises TimeoutError if
+    it's still stuck after that grace period; the worker thread is then
+    abandoned (daemon=True keeps it from blocking process exit).
+    """
+    outcome: dict = {}
+
+    def worker() -> None:
+        try:
+            outcome["value"] = fn()
+        except Exception as e:  # re-raised on the caller's thread below
+            outcome["error"] = e
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive() and on_timeout is not None:
+        try:
+            on_timeout()
+        except Exception:
+            pass
+        t.join(15)
+    if t.is_alive():
+        raise TimeoutError(f"operation did not return within {timeout:.0f}s (+15s grace)")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("value")  # type: ignore[return-value]
 
 
 def looks_like_closed_browser(e: Exception) -> bool:

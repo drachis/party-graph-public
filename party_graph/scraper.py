@@ -25,6 +25,14 @@ class BotDetected(Exception):
     just skip this one item and move on."""
 
 
+class StuckNavigation(Exception):
+    """Raised when goto() returns but the page never actually got to the
+    target URL -- e.g. it silently landed on about:blank. Seen once in
+    practice as a real hang: the tab sat on about:blank and Playwright's
+    own timeouts didn't fire (page.evaluate() has no timeout of its own),
+    so it looked frozen until closed by hand."""
+
+
 def _looks_blocked(page, response) -> str | None:
     """Return a short reason if this looks like a block/challenge page."""
     if response is not None and response.status in (403, 429, 503):
@@ -63,6 +71,9 @@ def gather_date_once(url: str, ctx) -> dict:
             page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
             pass
+
+        if page.url == "about:blank" or "partiful.com" not in page.url:
+            raise StuckNavigation(f"landed on {page.url!r} instead of the event page")
 
         reason = _looks_blocked(page, response)
         if reason:
@@ -108,6 +119,8 @@ def scrape_once(url: str, ctx) -> dict:
             page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
             pass
+        if page.url == "about:blank" or "partiful.com" not in page.url:
+            raise StuckNavigation(f"landed on {page.url!r} instead of the event page")
         human_dwell(page)
         data = extract(page)
         data["url"] = url

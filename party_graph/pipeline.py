@@ -16,6 +16,7 @@ from party_graph.config import (
     GATHER_EMPTY_STREAK_LIMIT,
     GATHER_GAP_MAX,
     GATHER_GAP_MIN,
+    GATHER_HARD_TIMEOUT,
     GATHER_LONG_PAUSE_CHANCE,
     GATHER_LONG_PAUSE_MAX,
     GATHER_LONG_PAUSE_MIN,
@@ -35,7 +36,13 @@ from party_graph.output import (
 )
 from party_graph.scraper import BotDetected, gather_date_once, scrape_login_mode, scrape_once
 from party_graph.state import draw_budget, load_state, robots_allow, save_state, wait_for_window
-from party_graph.utils import log, looks_like_closed_browser, parse_hhmm, parse_rsvp_timestamp
+from party_graph.utils import (
+    log,
+    looks_like_closed_browser,
+    parse_hhmm,
+    parse_rsvp_timestamp,
+    run_with_timeout,
+)
 
 
 def load_tokens(fresh: bool = False) -> list[tuple[str, str]]:
@@ -237,38 +244,55 @@ def run_gather_dates(args: argparse.Namespace) -> None:
     gap_lo = max(GATHER_GAP_MIN, min_gap or 0)
     gap_hi = max(GATHER_GAP_MAX, gap_lo)
 
-    consecutive_empty = 0
+    # Counts BOTH non-fatal exceptions (a flaky nav, a StuckNavigation blip)
+    # and dateless results in a row -- a streak of either is more likely a
+    # soft block settling in than that many unrelated one-off glitches.
+    consecutive_trouble = 0
     with sync_playwright() as pw:
         ctx = launch_context(pw)
         for i, (tok, url) in enumerate(todo, 1):
             log(f"({i}/{len(todo)}) {tok}")
+
+            def _force_unstick(ctx=ctx):
+                log(f"  !! no response after {GATHER_HARD_TIMEOUT:.0f}s -- page may be frozen "
+                    "(e.g. stuck on about:blank); forcing the browser context closed to unstick it")
+                ctx.close()
+
             try:
-                d = gather_date_once(url, ctx)
+                d = run_with_timeout(
+                    lambda u=url: gather_date_once(u, ctx),
+                    timeout=GATHER_HARD_TIMEOUT,
+                    on_timeout=_force_unstick,
+                )
             except BotDetected as e:
                 log(f"  !! looks like Partiful is flagging this as bot activity ({e}) "
                     "-- stopping the run now, not pushing further.")
                 break
             except Exception as e:
-                if looks_like_closed_browser(e):
-                    log(f"  !! browser/context closed unexpectedly ({e.__class__.__name__}) "
+                if isinstance(e, TimeoutError) or looks_like_closed_browser(e):
+                    log(f"  !! browser/context closed or hung ({e.__class__.__name__}) "
                         "-- stopping now rather than failing through every remaining item.")
                     break
                 log(f"  failed: {e.__class__.__name__}: {e}")
+                consecutive_trouble += 1
+                if consecutive_trouble >= GATHER_EMPTY_STREAK_LIMIT:
+                    log(f"  !! {consecutive_trouble} failed/dateless pages in a row -- more likely "
+                        "a soft block than that many unrelated glitches. Stopping out of caution.")
+                    break
                 continue
 
             d["token"] = tok
             known[tok] = d
             save_event_dates(known)
             if d.get("raw_date"):
-                consecutive_empty = 0
+                consecutive_trouble = 0
                 log(f"  -> {d['raw_date']!r}")
             else:
-                consecutive_empty += 1
+                consecutive_trouble += 1
                 log("  -> no date text found (page may be restricted/changed)")
-                if consecutive_empty >= GATHER_EMPTY_STREAK_LIMIT:
-                    log(f"  !! {consecutive_empty} dateless pages in a row -- more likely a "
-                        "soft block than that many individually-restricted events. "
-                        "Stopping out of caution.")
+                if consecutive_trouble >= GATHER_EMPTY_STREAK_LIMIT:
+                    log(f"  !! {consecutive_trouble} failed/dateless pages in a row -- more likely "
+                        "a soft block than that many unrelated glitches. Stopping out of caution.")
                     break
 
             if i < len(todo):
