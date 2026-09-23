@@ -16,7 +16,6 @@ from party_graph.config import (
     GATHER_EMPTY_STREAK_LIMIT,
     GATHER_GAP_MAX,
     GATHER_GAP_MIN,
-    GATHER_HARD_TIMEOUT,
     GATHER_LONG_PAUSE_CHANCE,
     GATHER_LONG_PAUSE_MAX,
     GATHER_LONG_PAUSE_MIN,
@@ -36,13 +35,7 @@ from party_graph.output import (
 )
 from party_graph.scraper import BotDetected, gather_date_once, scrape_login_mode, scrape_once
 from party_graph.state import draw_budget, load_state, robots_allow, save_state, wait_for_window
-from party_graph.utils import (
-    log,
-    looks_like_closed_browser,
-    parse_hhmm,
-    parse_rsvp_timestamp,
-    run_with_timeout,
-)
+from party_graph.utils import log, looks_like_closed_browser, parse_hhmm, parse_rsvp_timestamp
 
 
 def load_tokens(fresh: bool = False) -> list[tuple[str, str]]:
@@ -253,24 +246,15 @@ def run_gather_dates(args: argparse.Namespace) -> None:
         for i, (tok, url) in enumerate(todo, 1):
             log(f"({i}/{len(todo)}) {tok}")
 
-            def _force_unstick(ctx=ctx):
-                log(f"  !! no response after {GATHER_HARD_TIMEOUT:.0f}s -- page may be frozen "
-                    "(e.g. stuck on about:blank); forcing the browser context closed to unstick it")
-                ctx.close()
-
             try:
-                d = run_with_timeout(
-                    lambda u=url: gather_date_once(u, ctx),
-                    timeout=GATHER_HARD_TIMEOUT,
-                    on_timeout=_force_unstick,
-                )
+                d = gather_date_once(url, ctx)
             except BotDetected as e:
                 log(f"  !! looks like Partiful is flagging this as bot activity ({e}) "
                     "-- stopping the run now, not pushing further.")
                 break
             except Exception as e:
-                if isinstance(e, TimeoutError) or looks_like_closed_browser(e):
-                    log(f"  !! browser/context closed or hung ({e.__class__.__name__}) "
+                if looks_like_closed_browser(e):
+                    log(f"  !! browser/context closed unexpectedly ({e.__class__.__name__}) "
                         "-- stopping now rather than failing through every remaining item.")
                     break
                 log(f"  failed: {e.__class__.__name__}: {e}")

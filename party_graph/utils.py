@@ -23,16 +23,23 @@ def run_with_timeout(fn: Callable[[], T], timeout: float,
     """Run fn() with a hard wall-clock ceiling, for calls that can hang
     with no timeout of their own.
 
-    Seen in practice: a Playwright tab silently landed on about:blank and
-    sat there -- page.evaluate() has no built-in timeout, so nothing in
-    the normal call chain ever raised, and it looked frozen until someone
-    closed the browser by hand. fn() runs in a daemon worker thread; if it
-    hasn't returned within `timeout` seconds, on_timeout() is called
-    (expected to forcibly tear something down -- e.g. close the browser
-    context -- so the blocked call unblocks with an exception) and we wait
-    a short grace period for it to actually unwind. Raises TimeoutError if
-    it's still stuck after that grace period; the worker thread is then
-    abandoned (daemon=True keeps it from blocking process exit).
+    DO NOT wrap Playwright sync-API calls with this. Tried exactly that
+    for a frozen-tab watchdog and it broke every call instantly with
+    "Cannot switch to a different thread": Playwright's sync API runs on
+    a greenlet tied to the thread that created it and cannot be driven
+    from a second thread at all, timeout or not. Reverted; see
+    scraper.StuckNavigation for the safe (same-thread) fix for that
+    specific symptom (a tab silently landing on about:blank). A real fix
+    for a fully wedged browser/CDP connection would need a subprocess
+    (killable at the OS level) rather than a thread -- not implemented.
+
+    Fine for genuinely thread-safe/blocking work in general: fn() runs in
+    a daemon worker thread; if it hasn't returned within `timeout`
+    seconds, on_timeout() is called (expected to make it stop blocking --
+    what that takes depends entirely on what fn() does) and we wait a
+    short grace period for it to unwind. Raises TimeoutError if it's still
+    stuck after that grace period; the worker thread is then abandoned
+    (daemon=True keeps it from blocking process exit).
     """
     outcome: dict = {}
 
